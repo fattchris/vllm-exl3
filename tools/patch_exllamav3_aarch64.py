@@ -125,6 +125,8 @@ void exl3_moe_cpu_set_prof(bool) {}
 bool exl3_moe_cpu_has_avx2() { return false; }
 bool exl3_moe_cpu_has_avx512_vnni() { return false; }
 bool exl3_moe_cpu_has_avx512_vbmi() { return false; }
+bool exl3_moe_cpu_has_avx512_bw() { return false; }
+int64_t exl3_moe_cpu_pool_stress(int, int, int, int) { return 0; }
 """,
     )
 
