@@ -1,0 +1,64 @@
+diff --git a/vllm/model_executor/model_loader/ep_weight_filter.py b/vllm/model_executor/model_loader/ep_weight_filter.py
+--- a/vllm/model_executor/model_loader/ep_weight_filter.py
++++ b/vllm/model_executor/model_loader/ep_weight_filter.py
+@@ -82,3 +82,27 @@ def should_skip_weight(
+     eid = parse_expert_id(weight_name)
+     if eid is None:
+         return False
+     return eid not in local_expert_ids
++
++
++# --- draft / speculative-decode expert weights are not covered by the filter --
++#
++# `local_expert_ids` is computed once from `model_config.get_num_experts()`, i.e.
++# the MAIN stack's expert count. A speculative draft (DSpark/MTP) that ships its
++# own routed experts inside the same checkpoint can have a DIFFERENT expert count
++# -- DeepSeek-V4.1-Flash has 384 in the main stack and 128 in the DSpark draft
++# (`dspark_n_routed_experts`). Applying the main-stack window to draft weights
++# drops experts that the draft's own map owns, and because the drop happens
++# before `get_tensor` there is no error, no warning, and no tensor in the model's
++# load loop to notice -- the draft silently runs on a subset of its experts.
++#
++# The draft's own `RoutedExperts.weight_loader` already drops non-local ids via
++# the draft's correctly-sized expert map, so pre-filtering draft weights is
++# redundant as well as wrong.
++_DRAFT_WEIGHT_PREFIXES = ("mtp.", "draft.", "speculator.")
++
++
++def is_draft_expert_weight(weight_name: str) -> bool:
++    """True for expert weights belonging to a speculative draft module."""
++    return any(weight_name.startswith(p) for p in _DRAFT_WEIGHT_PREFIXES)
++
++
++def should_skip_weight_draft_aware(
++    weight_name: str,
++    local_expert_ids: set[int] | None,
++) -> bool:
++    """`should_skip_weight`, but never pre-filters draft expert weights."""
++    if is_draft_expert_weight(weight_name):
++        return False
++    return should_skip_weight(weight_name, local_expert_ids)
+diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
+--- a/vllm/model_executor/model_loader/default_loader.py
++++ b/vllm/model_executor/model_loader/default_loader.py
+@@ -19,7 +19,7 @@
+ from vllm.model_executor.model_loader.ep_weight_filter import (
+     compute_local_expert_ids,
+ )
+@@ -398,7 +398,7 @@ class DefaultModelLoader(BaseModelLoader):
+         self.local_expert_ids = compute_local_expert_ids(
+             num_experts,
+             ep_size,
+             ep_rank,
+             placement=parallel_config.expert_placement_strategy,
+         )
+@@ -408,7 +408,9 @@ class DefaultModelLoader(BaseModelLoader):
+                 len(self.local_expert_ids),
+                 num_experts,
+             )
++        # NOTE: the weight iterator must consult `should_skip_weight_draft_aware`
++        # (see ep_weight_filter.py) rather than `should_skip_weight`, so draft
++        # experts are never pre-filtered with the main stack's expert window.
+         self._init_ep_weight_filter(model_config)
+ 
+         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
