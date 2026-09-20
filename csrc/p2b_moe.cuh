@@ -17,3 +17,16 @@ at::Tensor p2b_fused_moe_mk_cuda(const at::Tensor& x, at::Tensor& out,
     const at::Tensor& ids, const at::Tensor& rw,
     const at::Tensor& kg_tab, const at::Tensor& ku_tab, const at::Tensor& kd_tab,
     int64_t n_local, bool mcg, int64_t intermediate_size, float swiglu_limit);
+
+
+// Padded fixed-shape (ABI 4, capability flag P2B_MOE_PADDED) host entry: one
+// launch for the whole [MAX_T, MAX_K] routing grid; the live row count is a
+// device fact (n_valid) and is never read on the host.
+at::Tensor p2b_fused_moe_padded_cuda(const at::Tensor& x, at::Tensor& out,
+    const at::Tensor& gt, const at::Tensor& gu, const at::Tensor& gv,
+    const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
+    const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
+    const at::Tensor& ids, const at::Tensor& rw, const at::Tensor& n_valid,
+    const at::Tensor& kg_tab, const at::Tensor& ku_tab, const at::Tensor& kd_tab,
+    int64_t n_local, int64_t max_k, bool mcg, int64_t intermediate_size,
+    float swiglu_limit);

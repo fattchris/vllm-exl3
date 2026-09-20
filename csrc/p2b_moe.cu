@@ -1,14 +1,8 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
-// P2B_CB: expert codebook index selected at BUILD time.
-//   1 = MCG   (marker 0xCBAC1FED) -- historical default
-//   2 = mul1  (marker 0x83DCD12D) -- the codebook used by the DSV4.1-Flash EXL3 packs
-// The `mcg` kernel argument is a runtime TORCH_CHECK only; it cannot select a
-// codebook, because the trellis decode is a compile-time template parameter
-// (run_gemv_tile_k<CB> / run_gemm_tile_dq<BITS, CB, 0>). Building for the wrong
-// codebook decodes every expert to a plausible-looking but wrong vector, so the
-// check below is written to FAIL CLOSED on a mismatch.
+// P2B_CB: expert codebook index. 1 = MCG (0xCBAC1FED), 2 = mul1 (0x83DCD12D).
+// Build with -DP2B_CB=2 for mul1 packs. The bool arg is only a TORCH_CHECK.
 #ifndef P2B_CB
 #define P2B_CB 1
 #endif
@@ -908,7 +902,7 @@ at::Tensor p2b_fused_moe_mk_cuda(const at::Tensor& x, at::Tensor& out,
                 "mixed-K fused MoE dimensions exceed int32 kernel indexing");
     TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0f,
                 "mixed-K fused MoE SwiGLU limit must be finite and nonnegative (0 disables clipping)");
-    TORCH_CHECK(mcg == (P2B_CB == 1), "codebook mismatch: kernel built for cb=", P2B_CB, " but pack reports ", mcg ? "MCG" : "mul1", ". Rebuild with -DP2B_CB=2 for mul1 packs.");
+    TORCH_CHECK(mcg == (P2B_CB == 1), "codebook mismatch: this kernel was built for cb=", P2B_CB, " but the pack reports ", mcg ? "MCG" : "mul1");
     TORCH_CHECK(ids.dim() == 1 && ids.scalar_type() == at::kInt && ids.numel() > 0,
                 "mixed-K fused MoE expert indices must be a nonempty int32 routing vector");
     TORCH_CHECK(rw.scalar_type() == at::kHalf && rw.numel() == ids.numel(),
@@ -952,6 +946,946 @@ at::Tensor p2b_fused_moe_mk_cuda(const at::Tensor& x, at::Tensor& out,
 
     return out;
 }
+
+
+// ---------------------------------------------------------------------------
+// Padded fixed-shape additions (ABI 4, capability flag P2B_MOE_PADDED).
+// Everything above — the uniform-K path AND the shipped mixed-K path — stays
+// byte-identical to the staged PR #31 sources; the blocks below only add.
+// ---------------------------------------------------------------------------
+
+// Padded fixed-shape cooperative MoE kernel: ONE launch for the whole
+// [MAX_T, MAX_K] padded routing grid, whose live row count is a DEVICE fact
+// (n_valid_dev[0]) so the decode apply path never performs a device->host
+// read. Phase structure is identical to p2b_moe_mixedk_kernel above; the
+// differences are:
+//   * the routing list is the flattened padded grid ids[MAX_T*MAX_K]; slot e
+//     addresses token tok = e / max_k, and every per-slot phase loop carries
+//     a token guard (tok >= n_valid_dev[0]) next to the sentinel guard — so
+//     padded rows are skipped REGARDLESS of their content and stale ids from
+//     a previous longer step can never reach pointer tables or the
+//     accumulation;
+//   * phase 1 reads the token's own input row (x + tok * hidden + w * 128)
+//     and the weighted reduction is DETERMINISTIC: one block per output
+//     token loops that token's K experts sequentially in expert-index
+//     order, accumulates the fp32 products w * down in registers, and
+//     writes each accum element exactly once — there is NO atomicAdd in the
+//     token-sum path (float atomicAdd is ordered but its serialization
+//     order is scheduler-dependent, which made the cross-expert sum round
+//     differently run to run at T >= 6 and flipped greedy verify tokens);
+//   * the write-back covers all MAX_T rows: padded rows emit zeros (their
+//     block writes sum = 0.0f because the token guard fails).
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage0(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+    for (int j = tid; j < max_t * hidden; j += total_threads)
+        accum[j] = 0.0f;
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    {
+        int warps_per_exp = hidden / 128;
+        int total_warps = experts * warps_per_exp;
+        int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
+        int grid_warps = gridDim.x * (blockDim.x / 32);
+
+        for (; this_warp < total_warps; this_warp += grid_warps) {
+            int e = this_warp / warps_per_exp;
+            int w = this_warp % warps_per_exp;
+            int tok = e / max_k;
+            int src = ids[e];
+            if (src < 0 || src >= n_local) continue;
+            if (tok >= n_valid_dev[0]) continue;
+            const half* gu_e = reinterpret_cast<const half*>(gu_ptrs[src]);
+            const half* uu_e = reinterpret_cast<const half*>(uu_ptrs[src]);
+            half* hg_e = had_gate + e * hidden;
+            half* hu_e = had_up + e * hidden;
+
+            had_hf_r_128_inner<true, false>(x + (size_t) tok * hidden + w * 128, hg_e + w * 128, gu_e + (w * 128) % hidden, 0.088388347648f);
+            had_hf_r_128_inner<true, false>(x + (size_t) tok * hidden + w * 128, hu_e + w * 128, uu_e + (w * 128) % hidden, 0.088388347648f);
+        }
+
+    }
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage1(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Phase 2: Batched Gate & Up GEMV across all routing-grid slots
+    {
+        int total_work = 2 * experts * num_groups_gate;
+        for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
+            int is_up = item & 1;
+            int rem = item >> 1;
+            int e = rem / num_groups_gate;
+            int group = rem % num_groups_gate;
+            int tok = e / max_k;
+            int src = ids[e];
+            if (src < 0 || src >= n_local) continue;
+            if (tok >= n_valid_dev[0]) continue;
+
+            const uint32_t* B32 = reinterpret_cast<const uint32_t*>(is_up ? ut_ptrs[src] : gt_ptrs[src]);
+            const half2* A2 = reinterpret_cast<const half2*>((is_up ? had_up : had_gate) + e * hidden);
+            half* C = (is_up ? up : gate) + e * inter;
+            const int kb = (int) (is_up ? ku_tab[src] : kg_tab[src]);
+
+            run_gemv_tile_k<P2B_CB>(kb, B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
+        }
+
+    }
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage2(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Epilogue Hadamard on Gate and Up
+    {
+        int warps_per_exp = inter / 128;
+        int total_warps = experts * warps_per_exp;
+        int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
+        int grid_warps = gridDim.x * (blockDim.x / 32);
+
+        for (; this_warp < total_warps; this_warp += grid_warps) {
+            int e = this_warp / warps_per_exp;
+            int w = this_warp % warps_per_exp;
+            int tok = e / max_k;
+            int src = ids[e];
+            if (src < 0 || src >= n_local) continue;
+            if (tok >= n_valid_dev[0]) continue;
+            const half* gv_e = reinterpret_cast<const half*>(gv_ptrs[src]);
+            const half* uv_e = reinterpret_cast<const half*>(uv_ptrs[src]);
+            half* gp_e = gate + e * inter;
+            half* up_e = up + e * inter;
+
+            had_hf_r_128_inner<false, true>(gp_e + w * 128, gp_e + w * 128, gv_e + (w * 128) % inter, 0.088388347648f);
+            had_hf_r_128_inner<false, true>(up_e + w * 128, up_e + w * 128, uv_e + (w * 128) % inter, 0.088388347648f);
+        }
+
+    }
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage3(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Phase 3: SwiGLU activation + Down input Hadamard across all slots
+    {
+        // Match vLLM's input-clipped SwiGLU. Zero preserves the plain
+        // activation. Sentinel AND padded slots are skipped so uninitialized
+        // gate/up rows (possibly NaN/Inf) never enter the pipeline.
+        int total_elements = experts * inter;
+        for (int j = tid; j < total_elements; j += total_threads) {
+            int e3 = j / inter;
+            int tok3 = e3 / max_k;
+            int src3 = ids[e3];
+            if (src3 < 0 || src3 >= n_local) continue;
+            if (tok3 >= n_valid_dev[0]) continue;
+            float g = __half2float(gate[j]);
+            float u = __half2float(up[j]);
+            if (swiglu_limit > 0.0f) {
+                g = fminf(g, swiglu_limit);
+                u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+            }
+            float s = g / (1.0f + expf(-g));
+            had_down[j] = __float2half(s * u);
+        }
+
+}
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage4(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+        // Down input Hadamard on had_down
+        int warps_per_exp = inter / 128;
+        int total_warps = experts * warps_per_exp;
+        int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
+        int grid_warps = gridDim.x * (blockDim.x / 32);
+
+        for (; this_warp < total_warps; this_warp += grid_warps) {
+            int e = this_warp / warps_per_exp;
+            int w = this_warp % warps_per_exp;
+            int tok = e / max_k;
+            int src = ids[e];
+            if (src < 0 || src >= n_local) continue;
+            if (tok >= n_valid_dev[0]) continue;
+            const half* du_e = reinterpret_cast<const half*>(du_ptrs[src]);
+            half* hd_e = had_down + e * inter;
+
+            had_hf_r_128_inner<true, false>(hd_e + w * 128, hd_e + w * 128, du_e + (w * 128) % inter, 0.088388347648f);
+        }
+
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage5(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Phase 4: Batched Down GEMV across all routing-grid slots
+    {
+        int total_work = experts * num_groups_down;
+        for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
+            int e = item / num_groups_down;
+            int group = item % num_groups_down;
+            int tok = e / max_k;
+            int src = ids[e];
+            if (src < 0 || src >= n_local) continue;
+            if (tok >= n_valid_dev[0]) continue;
+
+            const uint32_t* B32 = reinterpret_cast<const uint32_t*>(dt_ptrs[src]);
+            const half2* A2 = reinterpret_cast<const half2*>(had_down + e * inter);
+            half* C = down + e * hidden;
+            const int kb = (int) kd_tab[src];
+
+            run_gemv_tile_k<P2B_CB>(kb, B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
+        }
+
+    }
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage6(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Down output Hadamard, then DETERMINISTIC per-token weighted reduction
+    {
+        int warps_per_exp = hidden / 128;
+        int total_warps = experts * warps_per_exp;
+        int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
+        int grid_warps = gridDim.x * (blockDim.x / 32);
+
+        for (; this_warp < total_warps; this_warp += grid_warps) {
+            int e = this_warp / warps_per_exp;
+            int w = this_warp % warps_per_exp;
+            int tok = e / max_k;
+            int src = ids[e];
+            if (src < 0 || src >= n_local) continue;
+            if (tok >= n_valid_dev[0]) continue;
+            const half* dv_e = reinterpret_cast<const half*>(dv_ptrs[src]);
+            half* dp_e = down + e * hidden;
+
+            had_hf_r_128_inner<false, true>(dp_e + w * 128, dp_e + w * 128, dv_e + (w * 128) % hidden, 0.088388347648f);
+        }
+
+}
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage7(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+        // Deterministic weighted reduction (verify-blocking bug fix): ONE
+        // BLOCK PER OUTPUT TOKEN. Each block walks its token's max_k slots
+        // sequentially in expert-index order (e = tok * max_k + k, k
+        // ascending), accumulates the fp32 products w * down in a register,
+        // and writes each accum element exactly once — no atomics in the
+        // token-sum path. The atomics this replaces were ordered but their
+        // serialization order was scheduler-dependent, so the cross-expert
+        // sum rounded differently run to run at T >= 6; a fixed expert order
+        // now rounds identically on every run. The per-expert GEMV partial
+        // sums above keep their existing deterministic block reductions —
+        // only the cross-expert sum order changed. Both guards stay
+        // load-bearing (cf. the mixed-K comment above): a skipped slot's
+        // `down` row is uninitialized and an uninitialized half can be NaN,
+        // so 0 * NaN = NaN would poison the token's accum even with a
+        // zeroed routing weight — skipped slots are never read; a padded
+        // token's row is simply written as exact zeros (sum stays 0.0f).
+        const int n_valid_red = n_valid_dev[0];
+        for (int tok = blockIdx.x; tok < max_t; tok += gridDim.x) {
+            const bool live_tok = tok < n_valid_red;
+            for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+                float sum = 0.0f;
+                if (live_tok) {
+                    for (int k = 0; k < max_k; ++k) {
+                        const int e = tok * max_k + k;
+                        const int src = ids[e];
+                        if (src < 0 || src >= n_local) continue;
+                        const float w = __half2float(rw[e]);
+                        sum += w * __half2float(down[(size_t) e * hidden + col]);
+                    }
+                }
+                accum[(size_t) tok * hidden + col] = sum;
+            }
+        }
+
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage8(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Write back to out: every padded row is exactly zero (its block wrote
+    // sum = 0.0f in the deterministic reduction: the token guard failed).
+    for (int j = tid; j < max_t * hidden; j += total_threads) {
+        out[j] = __float2half(accum[j]);
+    }
+
+}
+
+
+static void launch_moe_padded(
+    const at::Tensor& x, const at::Tensor& gt, const at::Tensor& gu,
+    const at::Tensor& gv, const at::Tensor& ut, const at::Tensor& uu,
+    const at::Tensor& uv, const at::Tensor& dt, const at::Tensor& du,
+    const at::Tensor& dv, const at::Tensor& ids, const at::Tensor& rw,
+    const at::Tensor& n_valid,
+    const at::Tensor& kg_tab, const at::Tensor& ku_tab, const at::Tensor& kd_tab,
+    int n_local, int max_k,
+    at::Tensor& out, at::Tensor& gate, at::Tensor& up, at::Tensor& down,
+    at::Tensor& had_gate, at::Tensor& had_up, at::Tensor& had_down,
+    at::Tensor& accum, int e, int hidden, int inter, float swiglu_limit)
+{
+    // Re-query occupancy for the padded kernel; never reuse the mixed-K or
+    // uniform-K resident counts (same rule as launch_moe_mixedk above — a
+    // stale occupancy figure for a cooperative launch is a correctness bug).
+    int dev = 0, sms = 0, resident = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    void* kernel = (void*) p2b_moe_padded_stage0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, 512, 0);
+    const int grid = std::max(1, resident * sms);
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const half* xp = reinterpret_cast<const half*>(x.data_ptr<c10::Half>());
+    const int64_t* gtp = gt.data_ptr<int64_t>();
+    const int64_t* gup = gu.data_ptr<int64_t>();
+    const int64_t* gvp = gv.data_ptr<int64_t>();
+    const int64_t* utp = ut.data_ptr<int64_t>();
+    const int64_t* uup = uu.data_ptr<int64_t>();
+    const int64_t* uvp = uv.data_ptr<int64_t>();
+    const int64_t* dtp = dt.data_ptr<int64_t>();
+    const int64_t* dup = du.data_ptr<int64_t>();
+    const int64_t* dvp = dv.data_ptr<int64_t>();
+    const int32_t* idp = ids.data_ptr<int32_t>();
+    const half* rwp = reinterpret_cast<const half*>(rw.data_ptr<c10::Half>());
+    // The ONLY host-side touch of n_valid: extracting the device pointer.
+    // Its value is read exclusively by the kernel's token guard.
+    const int32_t* nvp = n_valid.data_ptr<int32_t>();
+    const int8_t* kgp = kg_tab.data_ptr<int8_t>();
+    const int8_t* kup = ku_tab.data_ptr<int8_t>();
+    const int8_t* kdp = kd_tab.data_ptr<int8_t>();
+
+    half* gp = reinterpret_cast<half*>(gate.data_ptr<c10::Half>());
+    half* up_p = reinterpret_cast<half*>(up.data_ptr<c10::Half>());
+    half* dp = reinterpret_cast<half*>(down.data_ptr<c10::Half>());
+    half* op = reinterpret_cast<half*>(out.data_ptr<c10::Half>());
+    half* hg_p = reinterpret_cast<half*>(had_gate.data_ptr<c10::Half>());
+    half* hu_p = reinterpret_cast<half*>(had_up.data_ptr<c10::Half>());
+    half* hd_p = reinterpret_cast<half*>(had_down.data_ptr<c10::Half>());
+    float* accp = accum.data_ptr<float>();
+
+    void* args[] = {
+        (void*)&xp, (void*)&gtp, (void*)&gup, (void*)&gvp,
+        (void*)&utp, (void*)&uup, (void*)&uvp,
+        (void*)&dtp, (void*)&dup, (void*)&dvp,
+        (void*)&idp, (void*)&rwp,
+        (void*)&kgp, (void*)&kup, (void*)&kdp,
+        (void*)&nvp, (void*)&n_local, (void*)&max_k,
+        (void*)&gp, (void*)&up_p, (void*)&dp, (void*)&op,
+        (void*)&hg_p, (void*)&hu_p, (void*)&hd_p, (void*)&accp,
+        (void*)&e, (void*)&hidden, (void*)&inter, (void*)&swiglu_limit
+    };
+
+    // _CAPTURE_SPLIT (Astra A(i) / Fable captest2): ordinary same-stream launches.
+    // The cooperative launch was never recorded by relaxed capture (proven: canary
+    // survived replay), so the phases become independent kernels. Capture-legal.
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &resident, (void*) p2b_moe_padded_stage0, 512, 0);
+    const int grid_split = std::max(1, resident * sms);
+    void* kernels[] = {
+        (void*) p2b_moe_padded_stage0,
+        (void*) p2b_moe_padded_stage1,
+        (void*) p2b_moe_padded_stage2,
+        (void*) p2b_moe_padded_stage3,
+        (void*) p2b_moe_padded_stage4,
+        (void*) p2b_moe_padded_stage5,
+        (void*) p2b_moe_padded_stage6,
+        (void*) p2b_moe_padded_stage7,
+        (void*) p2b_moe_padded_stage8,
+    };
+    for (void* kfn : kernels) {
+        cuda_check(cudaLaunchKernel(kfn, dim3(grid_split), dim3(512), args, 0, stream));
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Host entry for the padded fixed-shape cooperative MoE kernel (ABI 4,
+// capability flag P2B_MOE_PADDED): ONE launch for the whole [MAX_T, MAX_K]
+// padded routing grid. Same pointer/K-table contract as
+// p2b_fused_moe_mk_cuda above, except:
+//   * x/out are [MAX_T, hidden] and ids/rw are the flattened [MAX_T, MAX_K]
+//     grid (ids must be 2-D with ids.size(0) == x.size(0));
+//   * the live row count is a DEVICE fact carried by n_valid (int32[1]).
+//     This entry validates its METADATA (CUDA, int32, numel == 1,
+//     contiguous) and NEVER reads its value — the host knows only
+//     MAX_T = x.size(0) from static shape metadata, and reading the count
+//     would put a device->host sync on the decode path. n_valid's data
+//     pointer is handed to the kernel via launch_moe_padded.
+// Padded rows (tok >= n_valid on the device) are skipped by the kernel's
+// token guard in every phase regardless of their ids/weights content, so
+// the write-back emits exactly zeros for them; the Python wrapper returns
+// the shape-static view out[:T].
+at::Tensor p2b_fused_moe_padded_cuda(const at::Tensor& x, at::Tensor& out,
+    const at::Tensor& gt, const at::Tensor& gu, const at::Tensor& gv,
+    const at::Tensor& ut, const at::Tensor& uu, const at::Tensor& uv,
+    const at::Tensor& dt, const at::Tensor& du, const at::Tensor& dv,
+    const at::Tensor& ids, const at::Tensor& rw, const at::Tensor& n_valid,
+    const at::Tensor& kg_tab, const at::Tensor& ku_tab, const at::Tensor& kd_tab,
+    int64_t n_local, int64_t max_k, bool mcg, int64_t intermediate_size,
+    float swiglu_limit) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf, "padded fused MoE requires CUDA fp16 input");
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kHalf, "padded fused MoE output must be CUDA fp16");
+    TORCH_CHECK(x.dim() == 2 && x.size(0) >= 1,
+                "padded fused MoE input must be a [MAX_T, hidden] matrix");
+    TORCH_CHECK(out.sizes() == x.sizes(), "padded fused MoE output shape must match input");
+    TORCH_CHECK(x.size(1) > 0 && x.size(1) % 128 == 0,
+                "padded fused MoE hidden width must be a positive multiple of 128");
+    TORCH_CHECK(intermediate_size > 0 && intermediate_size % 128 == 0,
+                "padded fused MoE local intermediate width must be a positive multiple of 128");
+    TORCH_CHECK(x.size(1) <= std::numeric_limits<int>::max() &&
+                intermediate_size <= std::numeric_limits<int>::max(),
+                "padded fused MoE dimensions exceed int32 kernel indexing");
+    TORCH_CHECK(x.size(0) * max_k <= std::numeric_limits<int>::max() &&
+                x.size(0) * x.size(1) <= std::numeric_limits<int>::max(),
+                "padded fused MoE grid exceeds int32 kernel indexing");
+    TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0f,
+                "padded fused MoE SwiGLU limit must be finite and nonnegative (0 disables clipping)");
+    TORCH_CHECK(mcg == (P2B_CB == 1),
+                "padded fused MoE codebook mismatch: this kernel was built for cb=", P2B_CB,
+                " but the pack reports ", mcg ? "MCG" : "mul1");
+    TORCH_CHECK(ids.dim() == 2 && ids.scalar_type() == at::kInt &&
+                ids.size(0) == x.size(0) && ids.size(1) >= 1,
+                "padded fused MoE requires an int32 [MAX_T, MAX_K] routing grid whose rows match x");
+    TORCH_CHECK(rw.scalar_type() == at::kHalf && rw.sizes() == ids.sizes(),
+                "padded fused MoE requires one fp16 routing weight per routing-grid slot");
+    // n_valid: metadata only. Its VALUE is a device fact read by the kernel's
+    // token guard; this host entry must never dereference it (no .item call,
+    // no host copy, no indexing) — that would be the device->host sync this
+    // entry exists to eliminate.
+    TORCH_CHECK(n_valid.is_cuda() && n_valid.dim() == 1 && n_valid.numel() == 1 &&
+                n_valid.scalar_type() == at::kInt && n_valid.is_contiguous() &&
+                n_valid.device() == x.device(),
+                "padded fused MoE requires a contiguous int32 CUDA n_valid scalar tensor on x.device()");
+    const at::Tensor* tensors[] = {&x, &out, &ids, &rw, &gt, &gu, &gv, &ut, &uu, &uv, &dt, &du, &dv,
+                                   &kg_tab, &ku_tab, &kd_tab};
+    for (const auto* tensor : tensors) {
+        TORCH_CHECK(tensor->device() == x.device() && tensor->is_contiguous(),
+                    "padded fused MoE tensors must be contiguous and on the input CUDA device");
+    }
+    for (const auto* ptrs : {&gt, &gu, &gv, &ut, &uu, &uv, &dt, &du, &dv}) {
+        TORCH_CHECK(ptrs->dim() == 1 && ptrs->scalar_type() == at::kLong &&
+                    ptrs->numel() == gt.numel() && ptrs->numel() > 0,
+                    "padded fused MoE pointer tables must be equally sized nonempty int64 vectors");
+    }
+    for (const auto* tab : {&kg_tab, &ku_tab, &kd_tab}) {
+        TORCH_CHECK(tab->is_cuda() && tab->dim() == 1 && tab->is_contiguous() &&
+                    tab->scalar_type() == at::kChar && tab->numel() == gt.numel(),
+                    "padded fused MoE requires int8 CUDA K tables with one entry per pointer-table slot");
+    }
+    TORCH_CHECK(n_local >= 1 && n_local <= static_cast<int64_t>(gt.numel()),
+                "padded fused MoE n_local must bound the pointer tables (1 <= n_local <= table length)");
+    TORCH_CHECK(max_k == ids.size(1),
+                "padded fused MoE max_k must equal the routing grid's column count");
+    const c10::cuda::CUDAGuard device_guard(x.device());
+    const int e = static_cast<int>(ids.numel());
+    const int max_t = static_cast<int>(x.size(0));
+    const int hidden = static_cast<int>(x.size(1));
+    const int inter = static_cast<int>(intermediate_size);
+
+    auto gate = at::empty({e, 1, inter}, x.options());
+    auto up = at::empty({e, 1, inter}, x.options());
+    auto down = at::empty({e, 1, hidden}, x.options());
+    auto had_gate = at::empty({e, 1, hidden}, x.options());
+    auto had_up = at::empty({e, 1, hidden}, x.options());
+    auto had_down = at::empty({e, 1, inter}, x.options());
+    auto accum = at::zeros({max_t, hidden}, x.options().dtype(at::kFloat));
+
+    launch_moe_padded(x, gt, gu, gv, ut, uu, uv, dt, du, dv, ids, rw, n_valid,
+                      kg_tab, ku_tab, kd_tab, static_cast<int>(n_local),
+                      static_cast<int>(max_k),
+                      out, gate, up, down, had_gate, had_up, had_down,
+                      accum, e, hidden, inter, swiglu_limit);
+
+    return out;
+}
+
 
 at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
     const at::Tensor& gt, const at::Tensor& gu, const at::Tensor& gv,
