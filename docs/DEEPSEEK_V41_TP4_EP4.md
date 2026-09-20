@@ -71,6 +71,63 @@ For V4.1 packs that omit the numeric boundary, the plugin can infer DSpark sourc
 
 The 384-expert main stack remains EXL3.
 
+### DSpark draft experts and the EP weight filter (required vLLM-side fix)
+
+A V4.1 pack carries **two different expert counts** in one checkpoint: the main
+stack's 384 and the DSpark draft's 128 (`dspark_n_routed_experts`). The model-side
+mapping already handles this, but the loader's **pre-read EP weight filter** does
+not: `default_loader.py` sizes `local_expert_ids` once from
+`model_config.get_num_experts()` (the main stack's 384) and then applies it to
+every expert weight in the checkpoint, draft weights included.
+
+With EP=4 the filter keeps a 96-wide expert window per rank while the draft's own
+map owns 32-wide windows, so:
+
+| EP rank | filter keeps | draft map owns | owned draft experts that load |
+|---|---|---|---|
+| 0 | [0, 96) | [0, 32) | 32/32 |
+| 1 | [96, 192) | [32, 64) | **0/32** |
+| 2 | [192, 288) | [64, 96) | **0/32** |
+| 3 | [288, 384) | [96, 128) | **0/32** |
+
+The drop happens **before** `get_tensor`, so the names never reach the model's load
+loop: there is no error, no warning, and nothing in the model to notice. The draft
+silently runs on **25% of its expert weights**, which shows up as acceptance that
+is flat and low across every domain -- including **no code premium**, where a
+healthy expert FFN makes code markedly easier to draft than prose.
+
+Measured on 4x DGX Spark (TP4/EP4, bs1, k=2), before and after the fix:
+
+| domain | ctx | before tok/s | after | before acc | after acc |
+|---|---|---|---|---|---|
+| code | 0 | 24.12 | **27.02** | 1.72 | **1.89** |
+| prose | 0 | 25.07 | **27.44** | 1.76 | **1.97** |
+| prose | 2k | -- | **30.21** | -- | **2.21** |
+| structured | 0 | 25.02 | **27.73** | 1.81 | **1.99** |
+
+**+9% to +20%** decode, best cell 30.21 tok/s.
+
+Apply `experiments/dsv41_nvme/patches/ep_weight_filter.draft-experts.patch` to the
+vLLM tree. The draft's own `RoutedExperts.weight_loader` still drops non-local ids
+through the draft's correctly-sized map, so skipping the pre-filter for draft
+weights loses no I/O saving that matters.
+
+**How to detect it on your own stack** (zero boots): compare the filter window
+against the draft's map for each rank and assert they intersect.
+
+```python
+main_experts, draft_experts, ep = 384, 128, 4
+for r in range(ep):
+    kept  = set(range(96 * r, 96 * r + 96))          # filter window
+    owned = set(range(32 * r, 32 * r + 32))          # draft map window
+    assert kept & owned == owned, f"rank {r} loses {len(owned - kept)} draft experts"
+```
+
+Or, at runtime, check that every rank reports a non-zero draft expert tensor after
+loading. A rank reporting all-zero `w13_weight` for its owned draft range has this
+bug.
+
+
 ## Runtime baseline
 
 Start from the dedicated vLLM DeepSeek V4.1 image/runtime rather than stock pip vLLM. Pin the exact image digest and plugin commit used for every measurement.
