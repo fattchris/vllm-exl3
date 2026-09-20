@@ -568,6 +568,36 @@ def _proj_from_shard_id(shard_id: str) -> str:
     raise ValueError(f"unknown EXL3 shard_id={shard_id}")
 
 
+
+
+# _PRESCAN_CACHE: one safetensors header parse per shard per process, not one
+# safe_open per expert key (11,520 re-parses per rank otherwise). Shapes are
+# immutable per (path, mtime, size).
+_PRESCAN_CACHE: dict = {}
+
+
+def _prescan_shape(model_dir: str, shard: str, key: str):
+    path = os.path.join(model_dir, shard)
+    try:
+        st = os.stat(path)
+        ck = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+    tbl = _PRESCAN_CACHE.get(ck)
+    if tbl is None:
+        from safetensors import safe_open
+        tbl = {}
+        try:
+            with safe_open(path, framework="pt") as f:
+                for k in f.keys():
+                    if k.endswith(".trellis"):
+                        tbl[k] = tuple(int(x) for x in f.get_slice(k).get_shape())
+        except Exception:
+            return None
+        _PRESCAN_CACHE[ck] = tbl
+    return tbl.get(key)
+
+
 def _try_prescan_trellis_shapes(
     layer: Any,
     num_experts: int,
@@ -644,10 +674,8 @@ def _try_prescan_trellis_shapes(
                         or math.prod(shape) * 2 != desc.nbytes):
                     raise ValueError("invalid EXL3 planned tensor metadata: " + key)
             else:
-                try:
-                    with safe_open(path, framework="pt") as f:
-                        shape = tuple(int(x) for x in f.get_slice(key).get_shape())
-                except Exception:
+                shape = _prescan_shape(model_dir, shard, key)  # _PRESCAN_CACHE
+                if shape is None:
                     return None
             shapes[proj][local_e] = shape
     return shapes
@@ -871,6 +899,85 @@ def _madv_dontneed_cpu_tensor(src: "torch.Tensor") -> bool:
 
 
 
+# _P1_POPULATE: install PTEs for the mmap'd safetensors view on the CPU side before the
+# H2D copy. Source views are MAP_PRIVATE file pages (safe_open pt backend); without this
+# the copy takes one fault per 4 KiB page (~80 MB/s observed on GB10).
+_P1_LIBC = None
+_P1_MODE = os.environ.get("VLLM_EXL3_PREFETCH", "populate")   # populate | willneed | clone | off
+_P1_LOOKAHEAD = int(os.environ.get("VLLM_EXL3_PREFETCH_LOOKAHEAD_MB", "128")) << 20
+_P1_STATS = {"calls": 0, "bytes": 0, "secs": 0.0, "errno": 0, "clone_fallbacks": 0}
+_MADV_WILLNEED, _MADV_POPULATE_READ = 3, 22
+
+
+def _p1_libc():
+    global _P1_LIBC
+    if _P1_LIBC is None:
+        import ctypes
+        lib = ctypes.CDLL("libc.so.6", use_errno=True)
+        lib.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        lib.madvise.restype = ctypes.c_int
+        _P1_LIBC = lib
+    return _P1_LIBC
+
+
+def _p1_prefault(src: "torch.Tensor") -> "torch.Tensor":
+    """Return a tensor whose pages are resident: ``src`` after MADV_POPULATE_READ
+    (+ MADV_WILLNEED lookahead into the following bytes of the same mapping), or a
+    clone() if madvise is refused (kernel < 5.14) / mode=clone."""
+    if _P1_MODE == "off" or src.device.type != "cpu" or not src.is_contiguous():
+        return src
+    n = int(src.numel()) * int(src.element_size())
+    if n == 0:
+        return src
+    import ctypes
+    page = 4096
+    start = int(src.data_ptr()) & ~(page - 1)            # round DOWN: always inside the file mapping
+    end = (int(src.data_ptr()) + n) & ~(page - 1)        # round DOWN: never past the mapping end
+    t0 = time.monotonic()
+    if _P1_MODE in ("populate", "willneed") and end > start:
+        lib = _p1_libc()
+        adv = _MADV_POPULATE_READ if _P1_MODE == "populate" else _MADV_WILLNEED
+        rc = lib.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), adv)
+        if rc == 0:
+            if _P1_LOOKAHEAD > 0:
+                # async readahead of what follows this view (safetensors lays data out in key
+                # order, and keys are iterated sorted). ENOMEM past the mapping end is harmless.
+                lib.madvise(ctypes.c_void_p(end), ctypes.c_size_t(_P1_LOOKAHEAD), _MADV_WILLNEED)
+            _P1_STATS["calls"] += 1; _P1_STATS["bytes"] += end - start
+            _P1_STATS["secs"] += time.monotonic() - t0
+            return src
+        _P1_STATS["errno"] = ctypes.get_errno()
+    out = src.clone()                                    # CPU memcpy -> CPU faults w/ fault-around + readahead
+    _P1_STATS["clone_fallbacks"] += 1
+    _P1_STATS["secs"] += time.monotonic() - t0
+    return out
+
+
+
+
+# _BOUNCE2: never let the GB10 copy engine translate file-backed pageable pages
+# through ATS (~250 MB/s measured). CPU memcpy into a pinned two-slot bounce
+# first (5-27 GB/s), then async H2D. Gate: direct 201/251 MB/s cold/warm vs
+# bounce 5.1/27.2 GB/s cold/warm on shard-05 trellis views.
+_BOUNCE_STATE = {"buf": None, "evt": [None, None], "slot": 0}
+
+
+def _bounce_copy(dst: "torch.Tensor", src: "torch.Tensor") -> None:
+    n = int(src.numel()) * int(src.element_size())
+    st = _BOUNCE_STATE
+    if st["buf"] is None or st["buf"].numel() < n:
+        st["buf"] = torch.empty(n, dtype=torch.uint8, device="cpu", pin_memory=True)
+        st["evt"] = [torch.cuda.Event(), torch.cuda.Event()]
+        st["slot"] = 0
+    i = st["slot"]
+    st["evt"][i].synchronize()  # previous H2D from this slot retired
+    bv = st["buf"][:n].view(src.dtype).view(src.shape)
+    bv.copy_(src)               # CPU memcpy: page cache -> pinned
+    dst.copy_(bv, non_blocking=True)
+    st["evt"][i].record()
+    st["slot"] = i ^ 1
+
+
 def _direct_fill_trellis_slot(
     layer: Any,
     proj: str,
@@ -904,7 +1011,14 @@ def _direct_fill_trellis_slot(
         src = src.to(dtype=torch.int16)
     if not src.is_contiguous():
         src = src.contiguous()
-    arena[idx].copy_(src, non_blocking=False)
+    src = _p1_prefault(src)  # _P1_POPULATE: install PTEs before the CPU memcpy
+    if arena[idx].is_cuda:
+        # Pinned bounce: one host memcpy plus an async H2D, no per-tensor sync.
+        _bounce_copy(arena[idx], src)
+    else:
+        # CPU arena (unit tests, CPU-only torch): blocking copy establishes
+        # completion before ``src`` is released.
+        arena[idx].copy_(src, non_blocking=False)
     _madv_dontneed_cpu_tensor(src)
     _DIRECT_FILL_STATS["DIRECT_FILL_CALLS"] += 1
     _DIRECT_FILL_STATS["DIRECT_FILL_BYTES"] += transient
@@ -1005,12 +1119,14 @@ def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
             stats["allocations_after"] += 1
             stats["final_bytes"] += int(arena.nbytes)
             # Free host pages for this shape group before the next alloc on UMA.
-            gc.collect()
+            if os.environ.get("EXL3_STAGING_GC", "0") == "1":
+                gc.collect()
         setattr(layer, proj_to_attr[proj], arenas)
 
     layer._exl3_trellis_staging = {"gate": {}, "up": {}, "down": {}}
-    gc.collect()
-    if torch.cuda.is_available():
+    if os.environ.get("EXL3_STAGING_GC", "0") == "1":
+        gc.collect()
+    if torch.cuda.is_available() and os.environ.get("EXL3_STAGING_GC", "0") == "1":
         try:
             torch.cuda.empty_cache()
         except Exception:
@@ -2575,6 +2691,25 @@ def _exl3_routed_experts_loader(layer: torch.nn.Module):
     return load_weights
 
 
+
+
+def _marker_row_host(marker: torch.Tensor) -> torch.Tensor:
+    """_BATCHED_MARKERS: one host transfer for the whole marker block."""
+    return marker.detach().reshape(-1).to("cpu", non_blocking=False)
+
+
+def _marker_or_none_host(host_row: torch.Tensor, idx: int):
+    v = int(host_row[idx].item()) if 0 <= idx < host_row.numel() else 0
+    return v if v != 0 else None
+
+
+def _marker_tensor_or_none_host(host_row: torch.Tensor, idx: int, device):
+    v = int(host_row[idx].item()) if 0 <= idx < host_row.numel() else 0
+    if v == 0:
+        return None
+    return torch.tensor([v], dtype=torch.int32, device=device)
+
+
 def _moe_marker_or_none(marker: torch.Tensor):
     """A codebook marker tensor if it was loaded (non-zero), else None."""
     return marker if int(marker.reshape(-1)[0].item()) != 0 else None
@@ -3053,6 +3188,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return
         if not hasattr(layer, "gate_trellis"):
             return
+        if not hasattr(layer, "gate_trellis"):
+            return
         # Pack staged trellis tensors into contiguous per-shape arenas before
         # building LinearEXL3 handles. Views preserve exact heterogeneous K.
         # Direct-fill plans have empty staging but still need stats finalized.
@@ -3105,6 +3242,13 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         n_exp = int(len(layer.gate_trellis))
         inners: list[dict[str, Any]] = []
         k_values: list[int] = []
+        # _BATCHED_MARKERS: prefetch every marker block once (4 host
+        # transfers) instead of 6 .item() syncs per expert (288/layer).
+        w13_mcg_h = _marker_row_host(layer.w13_mcg)
+        w13_mul1_h = _marker_row_host(layer.w13_mul1)
+        w2_mcg_h = _marker_row_host(layer.w2_mcg)
+        w2_mul1_h = _marker_row_host(layer.w2_mul1)
+        w13_ncol = 2  # [n_exp, 2, 1]
         for e in range(n_exp):
             gt = layer.gate_trellis[e]
             ut = layer.up_trellis[e]
@@ -3118,22 +3262,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 gt,
                 layer.w13_suh[e, 0],
                 layer.w13_svh[e, 0],
-                _moe_marker_or_none(layer.w13_mcg[e, 0]),
-                _moe_marker_or_none(layer.w13_mul1[e, 0]),
+                _marker_tensor_or_none_host(w13_mcg_h, e * w13_ncol + 0, gt.device),
+                _marker_tensor_or_none_host(w13_mul1_h, e * w13_ncol + 0, gt.device),
             )
             up = make_linear_exl3(
                 ut,
                 layer.w13_suh[e, 1],
                 layer.w13_svh[e, 1],
-                _moe_marker_or_none(layer.w13_mcg[e, 1]),
-                _moe_marker_or_none(layer.w13_mul1[e, 1]),
+                _marker_tensor_or_none_host(w13_mcg_h, e * w13_ncol + 1, ut.device),
+                _marker_tensor_or_none_host(w13_mul1_h, e * w13_ncol + 1, ut.device),
             )
             down = make_linear_exl3(
                 dt,
                 layer.w2_suh[e],
                 layer.w2_svh[e],
-                _moe_marker_or_none(layer.w2_mcg[e]),
-                _moe_marker_or_none(layer.w2_mul1[e]),
+                _marker_tensor_or_none_host(w2_mcg_h, e, dt.device),
+                _marker_tensor_or_none_host(w2_mul1_h, e, dt.device),
             )
             inners.append({"gate": gate, "up": up, "down": down})
             k_values.extend(
