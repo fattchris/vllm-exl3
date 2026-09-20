@@ -1,5 +1,17 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+
+// P2B_CB: expert codebook index selected at BUILD time.
+//   1 = MCG   (marker 0xCBAC1FED) -- historical default
+//   2 = mul1  (marker 0x83DCD12D) -- the codebook used by the DSV4.1-Flash EXL3 packs
+// The `mcg` kernel argument is a runtime TORCH_CHECK only; it cannot select a
+// codebook, because the trellis decode is a compile-time template parameter
+// (run_gemv_tile_k<CB> / run_gemm_tile_dq<BITS, CB, 0>). Building for the wrong
+// codebook decodes every expert to a plausible-looking but wrong vector, so the
+// check below is written to FAIL CLOSED on a mismatch.
+#ifndef P2B_CB
+#define P2B_CB 1
+#endif
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
@@ -402,7 +414,7 @@ void p2b_moe_batched_kernel(
             const half2* A2 = reinterpret_cast<const half2*>((is_up ? had_up : had_gate) + e * hidden);
             half* C = (is_up ? up : gate) + e * inter;
 
-            run_gemv_tile<BITS, 1, 0>(B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
+            run_gemv_tile<BITS, P2B_CB, 0>(B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
         }
         grid.sync();
     }
@@ -475,7 +487,7 @@ void p2b_moe_batched_kernel(
             const half2* A2 = reinterpret_cast<const half2*>(had_down + e * inter);
             half* C = down + e * hidden;
 
-            run_gemv_tile<BITS, 1, 0>(B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
+            run_gemv_tile<BITS, P2B_CB, 0>(B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
         }
         grid.sync();
     }
@@ -619,7 +631,7 @@ void p2b_moe_mixedk_kernel(
             half* C = (is_up ? up : gate) + e * inter;
             const int kb = (int) (is_up ? ku_tab[src] : kg_tab[src]);
 
-            run_gemv_tile_k<1>(kb, B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
+            run_gemv_tile_k<P2B_CB>(kb, B32, A2, C, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red);
         }
         grid.sync();
     }
@@ -701,7 +713,7 @@ void p2b_moe_mixedk_kernel(
             half* C = down + e * hidden;
             const int kb = (int) kd_tab[src];
 
-            run_gemv_tile_k<1>(kb, B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
+            run_gemv_tile_k<P2B_CB>(kb, B32, A2, C, kslices_down, inter, group, ntiles_down, warp, lane, sh_red);
         }
         grid.sync();
     }
@@ -896,7 +908,7 @@ at::Tensor p2b_fused_moe_mk_cuda(const at::Tensor& x, at::Tensor& out,
                 "mixed-K fused MoE dimensions exceed int32 kernel indexing");
     TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0f,
                 "mixed-K fused MoE SwiGLU limit must be finite and nonnegative (0 disables clipping)");
-    TORCH_CHECK(mcg, "mixed-K fused MoE currently instantiates the MCG codebook only (cb = 1)");
+    TORCH_CHECK(mcg == (P2B_CB == 1), "codebook mismatch: kernel built for cb=", P2B_CB, " but pack reports ", mcg ? "MCG" : "mul1", ". Rebuild with -DP2B_CB=2 for mul1 packs.");
     TORCH_CHECK(ids.dim() == 1 && ids.scalar_type() == at::kInt && ids.numel() > 0,
                 "mixed-K fused MoE expert indices must be a nonempty int32 routing vector");
     TORCH_CHECK(rw.scalar_type() == at::kHalf && rw.numel() == ids.numel(),
@@ -961,7 +973,8 @@ at::Tensor p2b_fused_moe_cuda(const at::Tensor& x, at::Tensor& out,
                 "fused MoE dimensions exceed int32 kernel indexing");
     TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0f,
                 "fused MoE SwiGLU limit must be finite and nonnegative (0 disables clipping)");
-    TORCH_CHECK(mcg && kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4), "unsupported fused MoE K");
+    TORCH_CHECK(mcg == (P2B_CB == 1) && kg == ku && ku == kd && (kg == 2 || kg == 3 || kg == 4),
+                "unsupported fused MoE K, or codebook mismatch: this kernel was built for cb=", P2B_CB);
     TORCH_CHECK(ids.dim() == 1 && ids.scalar_type() == at::kInt && ids.numel() > 0,
                 "fused MoE expert indices must be a nonempty int32 routing vector");
     TORCH_CHECK(rw.scalar_type() == at::kHalf && rw.numel() == ids.numel(),
