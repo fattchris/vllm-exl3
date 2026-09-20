@@ -1,34 +1,51 @@
 #!/usr/bin/env bash
-# build.sh — compile the PATCHED vllm_exl3_c extension (multi-K p2b MoE,
-# kernel-work/patched/) for SM121 (GB10, compute_121) on a build node
-# (201-204) inside the deepseek-v41-exl3:fresh image.
+# build.sh -- compile the patched vllm_exl3_c extension for SM121
+# (GB10 / DGX Spark, compute_121) from the sources staged in this directory.
+#
+# The extension is built from the three patched C++/CUDA sources next to this
+# script, overlaid on a copy of an existing vllm_exl3 source tree. The installed
+# plugin is never mutated; the result is staged under ./build/ together with the
+# ptxas -v log. Deploying the .so into a running container is out of scope.
 #
 # Phases:
-#   probe   record the K5/K6 decoder-route evidence (dq8_regs_* / dq_dispatch
-#           greps) and diff the node's /opt/vllm-exl3/csrc against the staged
-#           kernel-work/csrc pin into kernel-work/patched/build-probe.log;
-#   overlay copy /opt/vllm-exl3 to a scratch tree and overlay the three
-#           patched sources (the installed plugin is never mutated);
-#   build   mode A: the proven pip recipe (setup.py build_ext --inplace with
-#               EXL3_EXT_INCLUDE + TORCH_CUDA_ARCH_LIST=12.1a + NVCC_APPEND_FLAGS
-#               -Xptxas -v);
+#   probe   record the K5/K6 decoder-route evidence and diff the source tree's
+#           csrc against the staged pin (skipped when the tree has no csrc);
+#   overlay copy the source tree to a scratch dir and overlay the patched sources;
+#   build   mode A: setup.py build_ext --inplace with EXL3_EXT_INCLUDE +
+#                   TORCH_CUDA_ARCH_LIST=12.1a + NVCC_APPEND_FLAGS "-Xptxas -v";
 #           mode B: torch.utils.cpp_extension driver invoking nvcc directly with
-#               -gencode arch=compute_121,code=sm_121 -Xptxas -v (fallback);
-#   smoke   import the produced .so and assert ABI 4 + the new and old
-#           entry points.
+#                   -gencode arch=compute_121,code=sm_121 -Xptxas -v (fallback);
+#   smoke   import the produced .so and assert the ABI and entry points.
 #
-# The result lands in kernel-work/patched/build/vllm_exl3_c*.so together with
-# the ptxas -v log. DEPLOYMENT (docker cp into dsv41-tp4, serve restart) is
-# explicitly OUT OF SCOPE — this script stages only.
+# Usage:
+#   bash build.sh [--probe-only] [--mode a|b] [--skip-smoke] [--allow-drift]
+#                 [--src-tree /path/to/vllm_exl3] [--out DIR]
 #
-# Usage: bash kernel-work/build.sh [--probe-only] [--mode a|b] [--skip-smoke]
-#                                 [--src-tree /opt/vllm-exl3] [--allow-drift]
+# --src-tree defaults to $VLLM_EXL3_SRC, then to the installed package location,
+# then to ./src. Point it at your checkout of the vllm_exl3 sources.
+#
+# Build flags that matter:
+#   TORCH_CUDA_ARCH_LIST=12.1a   required for SM121
+#   NVCC_APPEND_FLAGS            how extra -D flags reach nvcc in this recipe
+#                                (NVCC_PREPEND_FLAGS does NOT propagate)
+#   -DP2B_CB=<1|2>               expert codebook: 1 = MCG, 2 = mul1.
+#                                See ../README.md; a mismatch fails closed.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Sources to overlay onto the tree. Defaults to the csrc/ staged next to this
+# script (that is what ships in the repo). An optional ./patched directory can
+# override it for local experiments; it is not required.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Sources to overlay onto the tree: the repo's own csrc/ (this is what ships in
+# the PR). An optional tools/multik/patched/ directory overrides it for local
+# experiments; it is not required.
+STAGED="$REPO_ROOT/csrc"
 PATCHED="$SCRIPT_DIR/patched"
-STAGED="$SCRIPT_DIR/csrc"
+if [ ! -d "$PATCHED" ]; then
+    PATCHED="$STAGED"
+fi
 OUT="$PATCHED/build"
 PROBE_LOG="$PATCHED/build-probe.log"
 
@@ -36,7 +53,7 @@ MODE="a"
 PROBE_ONLY=0
 SKIP_SMOKE=0
 ALLOW_DRIFT=0
-SRC_TREE="/opt/vllm-exl3"
+SRC_TREE="${VLLM_EXL3_SRC:-/opt/vllm-exl3}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --probe-only) PROBE_ONLY=1 ;;
@@ -243,4 +260,4 @@ print(f"smoke: ABI 4, P2B_MOE_MIXED_K=true, entries: p2b_fused_moe_mk + p2b_fuse
 PY
 fi
 
-echo "build.sh: DONE (staged under $OUT — deployment to dsv41-tp4 is out of scope)"
+echo "build.sh: DONE (staged under $OUT — deploying the .so is out of scope)"
