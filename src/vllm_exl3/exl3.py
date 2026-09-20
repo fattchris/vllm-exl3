@@ -1338,7 +1338,8 @@ def apply_exl3_python_loop(
 
 def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]]) -> None:
     """Pointer tables + fused temps, once after load. No per-token alloc."""
-    if getattr(layer, "_exl3_mixed_store", None) is not None:
+    mixed_k = getattr(layer, "_exl3_mixed_k", False)
+    if getattr(layer, "_exl3_mixed_store", None) is not None and not mixed_k:
         raise ValueError("EXL3 mixed-K cannot build uniform-K fused pointer tables")
     try:
         exllamav3_ext = load_exllamav3_ext()
@@ -1415,7 +1416,31 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         _FUSED_TEMP_CACHE[key] = temps
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
-    layer._exl3_k = int(layer._exl3_bits)
+    if mixed_k:
+        # Per-expert K arrays for exl3_moe_mixedk; scalar _exl3_k is invalid.
+        layer._exl3_k = None
+        layer._exl3_mixedk_unified = True
+        k_gate = torch.tensor(
+            [int(pack["gate"].trellis.shape[-1]) // 16 for pack in inners],
+            dtype=torch.int32,
+            device=device,
+        )
+        k_up = torch.tensor(
+            [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
+            dtype=torch.int32,
+            device=device,
+        )
+        k_down = torch.tensor(
+            [int(pack["down"].trellis.shape[-1]) // 16 for pack in inners],
+            dtype=torch.int32,
+            device=device,
+        )
+        layer._exl3_K_gate_arr = k_gate
+        layer._exl3_K_up_arr = k_up
+        layer._exl3_K_down_arr = k_down
+    else:
+        layer._exl3_k = int(layer._exl3_bits)
+        layer._exl3_mixedk_unified = False
 
 
 def _native_moe_dimensions_supported(
@@ -1807,8 +1832,9 @@ def apply_exl3_fused_moe(
     expert_map: torch.Tensor | None,
     limit: float | None = None,
 ) -> torch.Tensor:
-    """One exl3_moe launch per uniform-K layer, with fat-expert fallback."""
-    if getattr(layer, "_exl3_mixed_store", None) is not None:
+    """One exl3_moe launch per layer, with fat-expert fallback. Supports mixed-K via exl3_moe_mixedk."""
+    is_mixedk = getattr(layer, "_exl3_mixedk_unified", False)
+    if getattr(layer, "_exl3_mixed_store", None) is not None and not is_mixedk:
         raise ValueError("EXL3 mixed-K cannot use the uniform-K fused/fat entry point")
     tokens, hidden = x2d.shape
     n_exp = len(inners)
@@ -1892,8 +1918,10 @@ def apply_exl3_fused_moe(
     # the slot scratch is capped at 256, i.e. tokens <= 42 at topk 6, which covers
     # single-stream speculation and light-concurrency traffic. Larger batches and
     # fat routes fall through to the stock path below.
+    # Mixed-K layers skip coop and use the mixedk kernel instead.
     if (
         _COOP
+        and not is_mixedk
         and tokens * topk <= 256
         and hasattr(exllamav3_ext, "exl3_moe_coop")
         and not (fat_possible and bool(fat.any().item()))
@@ -1961,41 +1989,79 @@ def apply_exl3_fused_moe(
     # -1 = unknown active count: max-concurrency grid, no .item() host sync.
     n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
 
-    k = int(getattr(layer, "_exl3_k", 4))
-    args = (
-        xh,
-        out,
-        standard_count,
-        token_sorted,
-        weight_sorted,
-        temps[0],
-        temps[1],
-        temps[2],
-        temps[3],
-        MOE_ACT_SILU,
-        k,
-        k,
-        k,
-        ptrs["gate_trellis"],
-        ptrs["gate_suh"],
-        ptrs["gate_svh"],
-        ptrs["up_trellis"],
-        ptrs["up_suh"],
-        ptrs["up_svh"],
-        ptrs["down_trellis"],
-        ptrs["down_suh"],
-        ptrs["down_svh"],
-        *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
-        float(limit) if (limit is not None and limit > 0) else 0.0,
-    )
-    # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
-    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
-    if tail and n_active_host is None:
-        n_active_host = -1
-    if n_active_host is not None:
-        fn(*args, n_active_host, *tail)
+    if is_mixedk and hasattr(exllamav3_ext, "exl3_moe_mixedk"):
+        # Mixed-K fused dispatch: per-expert K arrays instead of scalar K.
+        fn_mk = exllamav3_ext.exl3_moe_mixedk
+        args_mk = (
+            xh,
+            out,
+            standard_count,
+            token_sorted,
+            weight_sorted,
+            temps[0],
+            temps[1],
+            temps[2],
+            temps[3],
+            MOE_ACT_SILU,
+            layer._exl3_K_gate_arr,
+            layer._exl3_K_up_arr,
+            layer._exl3_K_down_arr,
+            ptrs["gate_trellis"],
+            ptrs["gate_suh"],
+            ptrs["gate_svh"],
+            ptrs["up_trellis"],
+            ptrs["up_suh"],
+            ptrs["up_svh"],
+            ptrs["down_trellis"],
+            ptrs["down_suh"],
+            ptrs["down_svh"],
+            *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
+            float(limit) if (limit is not None and limit > 0) else 0.0,
+        )
+        tail = _exl3_moe_tail(fn_mk, _exl3_moe_temp_rows(temps))
+        n_active_mk = -1 if _exl3_moe_accepts_num_active(fn_mk) else None
+        if tail and n_active_mk is None:
+            n_active_mk = -1
+        if n_active_mk is not None:
+            fn_mk(*args_mk, n_active_mk, *tail)
+        else:
+            fn_mk(*args_mk)
     else:
-        fn(*args)
+        k = int(getattr(layer, "_exl3_k", 4))
+        args = (
+            xh,
+            out,
+            standard_count,
+            token_sorted,
+            weight_sorted,
+            temps[0],
+            temps[1],
+            temps[2],
+            temps[3],
+            MOE_ACT_SILU,
+            k,
+            k,
+            k,
+            ptrs["gate_trellis"],
+            ptrs["gate_suh"],
+            ptrs["gate_svh"],
+            ptrs["up_trellis"],
+            ptrs["up_suh"],
+            ptrs["up_svh"],
+            ptrs["down_trellis"],
+            ptrs["down_suh"],
+            ptrs["down_svh"],
+            *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
+            float(limit) if (limit is not None and limit > 0) else 0.0,
+        )
+        # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
+        tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+        if tail and n_active_host is None:
+            n_active_host = -1
+        if n_active_host is not None:
+            fn(*args, n_active_host, *tail)
+        else:
+            fn(*args)
 
     if fat_possible and bool(fat.any().item()):
         fat_order = local.argsort()
@@ -2024,11 +2090,25 @@ def apply_exl3_experts(
 ) -> torch.Tensor:
     """Shipped routed-expert apply. `fused=None` honors EXL3_FUSED_MOE."""
     if getattr(layer, "_exl3_mixed_store", None) is not None:
-        from .tensor_mixed_k import apply_mixed_reference
+        # Mixed-K with the fused mixedk kernel available — route through the
+        # standard fused path which will dispatch to exl3_moe_mixedk.
+        if getattr(layer, "_exl3_mixedk_unified", False):
+            pass  # fall through to the normal fused/loop dispatch below
+        else:
+            from .tensor_mixed_k import apply_mixed_reference
 
-        if fused is True:
-            raise RuntimeError("EXL3 mixed-K currently supports eager reference execution only")
-        return apply_mixed_reference(x, topk_ids, topk_weights, layer, limit=limit)
+            if fused is True:
+                raise RuntimeError("EXL3 mixed-K currently supports eager reference execution only")
+            return apply_mixed_reference(x, topk_ids, topk_weights, layer, limit=limit)
+    elif getattr(layer, "_exl3_mixed_k", False):
+        # Standard per-expert-loop mixed-K (not tensor-mixed-K store) — the
+        # mixedk kernel path is handled via _exl3_mixedk_unified flag.
+        if not getattr(layer, "_exl3_mixedk_unified", False):
+            from .tensor_mixed_k import apply_mixed_reference
+
+            if fused is True:
+                raise RuntimeError("EXL3 mixed-K currently supports eager reference execution only")
+            return apply_mixed_reference(x, topk_ids, topk_weights, layer, limit=limit)
     if _EXL3_PREFILL_SYNC:
         _prefill_sync(int(x.numel() // x.shape[-1]))
     inners = getattr(layer, "_exl3_inners", None)
@@ -3088,13 +3168,32 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         fused_ok = False
         fused_err = None
         # Fused/native MoE launches take a single K for gate/up/down across the
-        # whole layer. Heterogeneous packed K must use the LinearEXL3 loop.
+        # whole layer. Heterogeneous packed K uses exl3_moe_mixedk when available,
+        # otherwise falls back to the LinearEXL3 loop.
         backend = get_moe_kernel_backend()
         if mixed_k:
-            fused_err = f"mixed_packed_K={sorted(set(k_values))}"
-            layer._exl3_ptrs = None
-            layer._exl3_fused_temps = None
-            layer._exl3_fused_concurrency = 0
+            # Check for the mixed-K fused kernel in exllamav3_ext.
+            try:
+                _ext = load_exllamav3_ext()
+                has_mixedk = _ext is not None and hasattr(_ext, "exl3_moe_mixedk")
+            except Exception:
+                has_mixedk = False
+            if has_mixedk and (fused_moe_enabled() or backend == "native"):
+                try:
+                    build_exl3_fused_state(layer, inners)
+                    fused_ok = True
+                except Exception as exc:
+                    fused_err = repr(exc)
+                    layer._exl3_ptrs = None
+                    layer._exl3_mixedk_unified = False
+            else:
+                fused_err = f"mixed_packed_K={sorted(set(k_values))}"
+                if not has_mixedk:
+                    fused_err += " (exl3_moe_mixedk not available)"
+                layer._exl3_ptrs = None
+                layer._exl3_fused_temps = None
+                layer._exl3_fused_concurrency = 0
+                layer._exl3_mixedk_unified = False
         elif fused_moe_enabled() or backend == "native":
             try:
                 has_native = backend == "native" and native_moe_kernel_available()
@@ -3116,15 +3215,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             )
         if not self._logged:
             if fused_ok:
+                fused_label = "exl3_moe_mixedk" if getattr(layer, "_exl3_mixedk_unified", False) else "exl3_moe"
                 logger.info(
                     "EXL3 MCG trellis engaged for routed experts: bits=%s "
                     "experts_local=%s hidden=%s intermediate_local=%s "
-                    "fused_moe=exl3_moe concurrency=%s "
+                    "fused_moe=%s concurrency=%s "
                     "(no BF16 expert reconstruct at load)",
                     self.bits,
                     n_exp,
                     layer._exl3_hidden_size,
                     layer._exl3_intermediate_local,
+                    fused_label,
                     getattr(layer, "_exl3_fused_concurrency", "?"),
                 )
             else:

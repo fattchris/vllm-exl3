@@ -36,6 +36,10 @@ Neither enabling the grouped planner nor requesting fewer fused rows currently c
 
 Release history and earlier kernel work belong in [CHANGELOG.md](CHANGELOG.md). Historical K4 fat-GEMM microbenchmarks are not evidence of K2/K3 grouped-prefill acceleration.
 
+### Mixed-K fused dispatch
+
+Mixed-K packs (layers with heterogeneous per-expert bit widths) now use `exl3_moe_mixedk` for fused single-kernel dispatch instead of falling back to the Python per-expert loop. This requires building against [vcruz305/exllamav3](https://github.com/vcruz305/exllamav3) at commit `329e051` or later, which provides the `exl3_moe_mixedk()` CUDA kernel. When the kernel is unavailable, the plugin falls back to the existing eager reference loop transparently.
+
 ## Compatibility and execution
 
 Existing integrations include `Glm5Next`, `DeepseekV4`, DeepSeek-V4.1 compatibility helpers for a V4.1-capable vLLM runtime, and `Qwen4ExpForConditionalGeneration`, each requiring its matching model plumbing. The plugin does not make an unsupported model architecture appear in either vLLM or standalone ExLlamaV3.
