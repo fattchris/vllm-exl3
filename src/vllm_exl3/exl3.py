@@ -966,8 +966,19 @@ def _bounce_copy(dst: "torch.Tensor", src: "torch.Tensor") -> None:
     n = int(src.numel()) * int(src.element_size())
     st = _BOUNCE_STATE
     if st["buf"] is None or st["buf"].numel() < n:
-        st["buf"] = torch.empty(n, dtype=torch.uint8, device="cpu", pin_memory=True)
-        st["evt"] = [torch.cuda.Event(), torch.cuda.Event()]
+        try:
+            st["buf"] = torch.empty(
+                n, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+            st["evt"] = [torch.cuda.Event(), torch.cuda.Event()]
+        except (RuntimeError, AssertionError):
+            # No pinned allocator (CPU-only torch, e.g. the unit-test runner).
+            # The bounce exists to keep the GB10 copy engine off file-backed
+            # pageable pages; with no accelerator there is nothing to bounce
+            # for, so fall back to the direct blocking copy.
+            st["buf"] = None
+            dst.copy_(src, non_blocking=False)
+            return
         st["slot"] = 0
     i = st["slot"]
     st["evt"][i].synchronize()  # previous H2D from this slot retired
@@ -1618,6 +1629,14 @@ def _native_moe_max_rows(bits: int) -> int:
     return _NATIVE_MOE_CONTRACT_ROWS
 
 
+
+# MCG is the historical codebook for native packs; the runtime truth is
+# ``layer._exl3_codebook_flags``, set once per layer during finalize. Layers that
+# predate the flag (or CPU fixtures that build a bare namespace) fall back to MCG,
+# matching every other consumer in this module.
+_MCG_CODEBOOK_FLAGS = (True, False) * 3
+
+
 def _apply_native_fused_moe(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -1639,7 +1658,7 @@ def _apply_native_fused_moe(
     """
     if getattr(layer, "_exl3_mixed_store", None) is not None:
         return None
-    if getattr(layer, "_exl3_codebook_flags", None) != (True, False) * 3:
+    if getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS) != _MCG_CODEBOOK_FLAGS:
         return None
     module = _load_native_exl3_ext()
     if module is None or not _native_moe_dimensions_supported(
@@ -2042,7 +2061,7 @@ def apply_exl3_fused_moe(
         and hasattr(exllamav3_ext, "exl3_moe_coop")
         and not (fat_possible and bool(fat.any().item()))
     ):
-        flags = getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False))
+        flags = getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)
         mcg, mul1 = bool(flags[0]), bool(flags[1])
         inter_dim = int(temps[2].shape[-1])
         if (
@@ -2131,7 +2150,7 @@ def apply_exl3_fused_moe(
             ptrs["down_trellis"],
             ptrs["down_suh"],
             ptrs["down_svh"],
-            *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
+            *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
             float(limit) if (limit is not None and limit > 0) else 0.0,
         )
         tail = _exl3_moe_tail(fn_mk, _exl3_moe_temp_rows(temps))
@@ -2142,6 +2161,39 @@ def apply_exl3_fused_moe(
             fn_mk(*args_mk, n_active_mk, *tail)
         else:
             fn_mk(*args_mk)
+    k = int(getattr(layer, "_exl3_k", 4))
+    args = (
+        xh,
+        out,
+        standard_count,
+        token_sorted,
+        weight_sorted,
+        temps[0],
+        temps[1],
+        temps[2],
+        temps[3],
+        MOE_ACT_SILU,
+        k,
+        k,
+        k,
+        ptrs["gate_trellis"],
+        ptrs["gate_suh"],
+        ptrs["gate_svh"],
+        ptrs["up_trellis"],
+        ptrs["up_suh"],
+        ptrs["up_svh"],
+        ptrs["down_trellis"],
+        ptrs["down_suh"],
+        ptrs["down_svh"],
+        *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
+        float(limit) if (limit is not None and limit > 0) else 0.0,
+    )
+    # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
+    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+    if tail and n_active_host is None:
+        n_active_host = -1
+    if n_active_host is not None:
+        fn(*args, n_active_host, *tail)
     else:
         k = int(getattr(layer, "_exl3_k", 4))
         args = (
@@ -2167,7 +2219,7 @@ def apply_exl3_fused_moe(
             ptrs["down_trellis"],
             ptrs["down_suh"],
             ptrs["down_svh"],
-            *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
+            *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
             float(limit) if (limit is not None and limit > 0) else 0.0,
         )
         # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
