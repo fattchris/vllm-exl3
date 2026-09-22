@@ -108,9 +108,11 @@ Measured on 4x DGX Spark (TP4/EP4, bs1, k=2), before and after the fix:
 **+9% to +20%** decode, best cell 30.21 tok/s.
 
 Apply `experiments/dsv41_nvme/patches/ep_weight_filter.draft-experts.patch` to the
-vLLM tree. The draft's own `RoutedExperts.weight_loader` still drops non-local ids
-through the draft's correctly-sized map, so skipping the pre-filter for draft
-weights loses no I/O saving that matters.
+vLLM tree. The patch rebinds `should_skip_weight` after saving the original, so
+existing iterator call sites pick up the draft exemption. A helper that nothing
+calls does not change loading. The draft's own `RoutedExperts.weight_loader`
+still drops non-local ids through the draft's correctly-sized map, so skipping the
+pre-filter for draft weights loses no I/O saving that matters.
 
 **How to detect it on your own stack** (zero boots): compare the filter window
 against the draft's map for each rank and assert they intersect.

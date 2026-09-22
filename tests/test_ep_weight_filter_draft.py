@@ -133,3 +133,15 @@ def test_scales_were_never_filtered_which_hid_the_bug() -> None:
     # quant method and was patched separately in the overlay.
     assert should_skip(draft_scale, kept) is True
     assert should_skip(draft_weight, kept) is True
+
+def test_patch_rebinds_should_skip_weight() -> None:
+    """The runtime patch must rebind the name callers already import."""
+    from pathlib import Path
+
+    text = Path(
+        "experiments/dsv41_nvme/patches/ep_weight_filter.draft-experts.patch"
+    ).read_text(encoding="utf-8")
+    assert "should_skip_weight = should_skip_weight_draft_aware" in text
+    assert "_should_skip_weight_before_draft = should_skip_weight" in text
+    assert "NOTE: the weight iterator must consult" not in text
+
