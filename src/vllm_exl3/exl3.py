@@ -956,34 +956,52 @@ def _p1_prefault(src: "torch.Tensor") -> "torch.Tensor":
 
 
 # _BOUNCE2: never let the GB10 copy engine translate file-backed pageable pages
-# through ATS (~250 MB/s measured). CPU memcpy into a pinned two-slot bounce
-# first (5-27 GB/s), then async H2D. Gate: direct 201/251 MB/s cold/warm vs
-# bounce 5.1/27.2 GB/s cold/warm on shard-05 trellis views.
-_BOUNCE_STATE = {"buf": None, "evt": [None, None], "slot": 0}
+# through ATS (~250 MB/s measured). CPU memcpy into a pinned bounce first
+# (5-27 GB/s), then async H2D. Two buffers, one per slot: one buffer is
+# overwritten by the next memcpy while the previous H2D is still reading it.
+# Gate: direct 201/251 MB/s cold/warm vs bounce 5.1/27.2 GB/s cold/warm
+# on shard-05 trellis views.
+_BOUNCE_STATE = {"bufs": [None, None], "evt": [None, None], "slot": 0, "cap": 0}
 
 
 def _bounce_copy(dst: "torch.Tensor", src: "torch.Tensor") -> None:
+    """Pinned H2D bounce. Two buffers, one per slot.
+
+    A single pinned buffer is a race: the next CPU memcpy overwrites it
+    while the previous non-blocking H2D is still reading it. Each slot has
+    its own buffer, and the slot event is waited before that buffer is reused.
+    Growing the buffers waits for both in-flight copies first.
+    """
     n = int(src.numel()) * int(src.element_size())
     st = _BOUNCE_STATE
-    if st["buf"] is None or st["buf"].numel() < n:
+    if st["bufs"][0] is None or st["cap"] < n:
+        for evt in st["evt"]:
+            if evt is not None:
+                evt.synchronize()
         try:
-            st["buf"] = torch.empty(
-                n, dtype=torch.uint8, device="cpu", pin_memory=True
-            )
-            st["evt"] = [torch.cuda.Event(), torch.cuda.Event()]
+            bufs = [
+                torch.empty(n, dtype=torch.uint8, device="cpu", pin_memory=True),
+                torch.empty(n, dtype=torch.uint8, device="cpu", pin_memory=True),
+            ]
+            evts = [torch.cuda.Event(), torch.cuda.Event()]
         except (RuntimeError, AssertionError):
             # No pinned allocator (CPU-only torch, e.g. the unit-test runner).
             # The bounce exists to keep the GB10 copy engine off file-backed
             # pageable pages; with no accelerator there is nothing to bounce
             # for, so fall back to the direct blocking copy.
-            st["buf"] = None
+            st["bufs"] = [None, None]
+            st["evt"] = [None, None]
+            st["cap"] = 0
             dst.copy_(src, non_blocking=False)
             return
+        st["bufs"] = bufs
+        st["evt"] = evts
+        st["cap"] = n
         st["slot"] = 0
     i = st["slot"]
-    st["evt"][i].synchronize()  # previous H2D from this slot retired
-    bv = st["buf"][:n].view(src.dtype).view(src.shape)
-    bv.copy_(src)               # CPU memcpy: page cache -> pinned
+    st["evt"][i].synchronize()  # previous H2D from this slot's buffer retired
+    bv = st["bufs"][i][:n].view(src.dtype).view(src.shape)
+    bv.copy_(src)  # CPU memcpy: page cache -> this slot's pinned buffer
     dst.copy_(bv, non_blocking=True)
     st["evt"][i].record()
     st["slot"] = i ^ 1
@@ -2161,39 +2179,6 @@ def apply_exl3_fused_moe(
             fn_mk(*args_mk, n_active_mk, *tail)
         else:
             fn_mk(*args_mk)
-    k = int(getattr(layer, "_exl3_k", 4))
-    args = (
-        xh,
-        out,
-        standard_count,
-        token_sorted,
-        weight_sorted,
-        temps[0],
-        temps[1],
-        temps[2],
-        temps[3],
-        MOE_ACT_SILU,
-        k,
-        k,
-        k,
-        ptrs["gate_trellis"],
-        ptrs["gate_suh"],
-        ptrs["gate_svh"],
-        ptrs["up_trellis"],
-        ptrs["up_suh"],
-        ptrs["up_svh"],
-        ptrs["down_trellis"],
-        ptrs["down_suh"],
-        ptrs["down_svh"],
-        *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
-        float(limit) if (limit is not None and limit > 0) else 0.0,
-    )
-    # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
-    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
-    if tail and n_active_host is None:
-        n_active_host = -1
-    if n_active_host is not None:
-        fn(*args, n_active_host, *tail)
     else:
         k = int(getattr(layer, "_exl3_k", 4))
         args = (
