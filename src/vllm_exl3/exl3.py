@@ -2034,39 +2034,6 @@ def apply_exl3_fused_moe(
             fn_mk(*args_mk, n_active_mk, *tail)
         else:
             fn_mk(*args_mk)
-    k = int(getattr(layer, "_exl3_k", 4))
-    args = (
-        xh,
-        out,
-        standard_count,
-        token_sorted,
-        weight_sorted,
-        temps[0],
-        temps[1],
-        temps[2],
-        temps[3],
-        MOE_ACT_SILU,
-        k,
-        k,
-        k,
-        ptrs["gate_trellis"],
-        ptrs["gate_suh"],
-        ptrs["gate_svh"],
-        ptrs["up_trellis"],
-        ptrs["up_suh"],
-        ptrs["up_svh"],
-        ptrs["down_trellis"],
-        ptrs["down_suh"],
-        ptrs["down_svh"],
-        *getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS),
-        float(limit) if (limit is not None and limit > 0) else 0.0,
-    )
-    # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
-    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
-    if tail and n_active_host is None:
-        n_active_host = -1
-    if n_active_host is not None:
-        fn(*args, n_active_host, *tail)
     else:
         k = int(getattr(layer, "_exl3_k", 4))
         args = (
