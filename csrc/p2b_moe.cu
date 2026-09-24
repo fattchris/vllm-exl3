@@ -1015,6 +1015,9 @@ void p2b_moe_padded_stage0(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1035,7 +1038,7 @@ void p2b_moe_padded_stage0(
     // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
     {
         int warps_per_exp = hidden / 128;
-        int total_warps = experts * warps_per_exp;
+        int total_warps = live * warps_per_exp;
         int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
         int grid_warps = gridDim.x * (blockDim.x / 32);
 
@@ -1098,6 +1101,9 @@ void p2b_moe_padded_stage1(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1117,7 +1123,7 @@ void p2b_moe_padded_stage1(
     
     // Phase 2: Batched Gate & Up GEMV across all routing-grid slots
     {
-        int total_work = 2 * experts * num_groups_gate;
+        int total_work = 2 * live * num_groups_gate;
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
             int is_up = item & 1;
             int rem = item >> 1;
@@ -1179,6 +1185,9 @@ void p2b_moe_padded_stage2(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1199,7 +1208,7 @@ void p2b_moe_padded_stage2(
     // Epilogue Hadamard on Gate and Up
     {
         int warps_per_exp = inter / 128;
-        int total_warps = experts * warps_per_exp;
+        int total_warps = live * warps_per_exp;
         int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
         int grid_warps = gridDim.x * (blockDim.x / 32);
 
@@ -1262,6 +1271,9 @@ void p2b_moe_padded_stage3(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1284,7 +1296,7 @@ void p2b_moe_padded_stage3(
         // Match vLLM's input-clipped SwiGLU. Zero preserves the plain
         // activation. Sentinel AND padded slots are skipped so uninitialized
         // gate/up rows (possibly NaN/Inf) never enter the pipeline.
-        int total_elements = experts * inter;
+        int total_elements = live * inter;
         for (int j = tid; j < total_elements; j += total_threads) {
             int e3 = j / inter;
             int tok3 = e3 / max_k;
@@ -1344,6 +1356,9 @@ void p2b_moe_padded_stage4(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1363,7 +1378,7 @@ void p2b_moe_padded_stage4(
     
         // Down input Hadamard on had_down
         int warps_per_exp = inter / 128;
-        int total_warps = experts * warps_per_exp;
+        int total_warps = live * warps_per_exp;
         int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
         int grid_warps = gridDim.x * (blockDim.x / 32);
 
@@ -1422,6 +1437,9 @@ void p2b_moe_padded_stage5(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1441,7 +1459,7 @@ void p2b_moe_padded_stage5(
     
     // Phase 4: Batched Down GEMV across all routing-grid slots
     {
-        int total_work = experts * num_groups_down;
+        int total_work = live * num_groups_down;
         for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
             int e = item / num_groups_down;
             int group = item % num_groups_down;
@@ -1501,6 +1519,9 @@ void p2b_moe_padded_stage6(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1521,7 +1542,7 @@ void p2b_moe_padded_stage6(
     // Down output Hadamard, then DETERMINISTIC per-token weighted reduction
     {
         int warps_per_exp = hidden / 128;
-        int total_warps = experts * warps_per_exp;
+        int total_warps = live * warps_per_exp;
         int this_warp = warp + (blockDim.x / 32) * blockIdx.x;
         int grid_warps = gridDim.x * (blockDim.x / 32);
 
@@ -1581,6 +1602,9 @@ void p2b_moe_padded_stage7(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
@@ -1674,6 +1698,9 @@ void p2b_moe_padded_stage8(
 
     // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
     const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
 
     const int ntiles_gate = inter / 16;
     const int kslices_gate = hidden / 16;
