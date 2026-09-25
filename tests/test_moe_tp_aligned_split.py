@@ -53,3 +53,23 @@ def test_trellis_tiles_and_scales_shard_consistently(monkeypatch) -> None:
     d = shard_exl3_row(down, "trellis", 2, 4, aligned=True)
     assert torch.equal(d, down[off // 16 : (off + length) // 16])
     assert shard_exl3_row(svh, "suh", 2, 4, aligned=True).numel() == length
+
+
+def test_unaligned_geometry_is_refused_not_silently_split(monkeypatch) -> None:
+    """An unalignable size must raise, not fall back to the equal split.
+
+    The equal split is what cuts a Hadamard block and decodes every shard
+    against the wrong transform. Falling back to it silently is the failure
+    this PR exists to remove, so with the env var set the load has to stop.
+    """
+    monkeypatch.setenv("VLLM_EXL3_MOE_TP_ALIGN", "128")
+    t = torch.arange(2300)
+    with pytest.raises(RuntimeError, match="not a multiple"):
+        _narrow_tp(t, 0, 0, 4, 1, aligned=True)
+
+
+def test_aligned_geometry_does_not_raise(monkeypatch) -> None:
+    monkeypatch.setenv("VLLM_EXL3_MOE_TP_ALIGN", "128")
+    t = torch.arange(2304)
+    assert _narrow_tp(t, 0, 2, 4, 1, aligned=True).numel() == 512
+

@@ -1203,7 +1203,17 @@ def _narrow_tp(
         return tensor
     size = int(tensor.shape[dim])
     align = _moe_tp_align() if aligned else 0
-    if align > 0 and (size * unit) % align == 0:
+    if align > 0:
+        if (size * unit) % align:
+            # Falling through to the equal split here would cut a Hadamard block
+            # and decode every shard against the wrong transform, silently. This
+            # path is only reachable with the opt-in env var set, so refuse the
+            # geometry instead of loading weights that cannot be right.
+            raise RuntimeError(
+                f"EXL3 aligned MoE TP: dim {dim} spans {size * unit} columns, which "
+                f"is not a multiple of the VLLM_EXL3_MOE_TP_ALIGN={align} Hadamard "
+                "block; unset VLLM_EXL3_MOE_TP_ALIGN or use an expert-parallel build"
+            )
         off, length = aligned_tp_split(size * unit, tp_rank, tp_size, align)
         return tensor.narrow(dim, off // unit, length // unit).contiguous()
     if size % tp_size:
