@@ -132,6 +132,6 @@ The experiment is based on current public vLLM interfaces, not undocumented assu
 - `vllm/config/offload.py` — UVA zero-copy weight offload and selective parameter segments;
 - `vllm/model_executor/offloader/uva.py` — pinned-host parameters exposed as accelerator views with `_vllm_is_uva_offloaded`;
 - `vllm/config/engram.py` — DeepSeek-V4.1-aware Engram CPU-offload configuration;
-- `vllm/models/deepseek_v4_1/common/engram.py` — pinned-host FP8 Engram tables read through UVA.
+- `vllm/models/deepseek_v41/common/engram.py` — pinned-host FP8 Engram tables read through UVA.
 
 Pin the exact vLLM revision used for every result because these interfaces are moving quickly.

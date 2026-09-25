@@ -18,9 +18,9 @@ Please credit **vcruz305** and the upstream work this project builds on:
 
 Exact copied/derived files, historical notices, and the distinction between adapted design and independent implementation are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [docs/provenance.md](docs/provenance.md).
 
-## Current development candidate: 0.4.2
+## Current development candidate: 0.5.0
 
-The package metadata on this development line is `0.4.2`; this is **not a claim that a 0.4.2 wheel has been published or GPU-qualified**. The executable candidate for the GLM TP1 test protocol is commit `d3cfd394920360d69f820d2dc96f8292a9e10283`. Its CPU/source/packaging CI passed; end-to-end GB10 qualification is still required.
+The package metadata on this development line is `0.5.0`; this is **not a claim that a 0.5.0 wheel has been published or GPU-qualified**. This line carries the MoE-TP4 kernel work — a Hadamard-aligned uneven TP split, a CUDA-graph-capturable padded MoE, grouped expert execution and a multi-K fused launch — none of which is on by default, plus the vLLM 0.30.0 compatibility audit in [docs/VLLM_COMPATIBILITY.md](docs/VLLM_COMPATIBILITY.md). CPU/source/packaging CI passed; end-to-end GB10 qualification is still required. The previous development line's executable candidate for the GLM TP1 test protocol is commit `d3cfd394920360d69f820d2dc96f8292a9e10283`.
 
 | Change | What is implemented | Qualification boundary |
 |---|---|---|
@@ -43,6 +43,8 @@ Mixed-K packs (layers with heterogeneous per-expert bit widths) now use `exl3_mo
 ## Compatibility and execution
 
 Existing integrations include `Glm5Next`, `DeepseekV4`, DeepSeek-V4.1 compatibility helpers for a V4.1-capable vLLM runtime, and `Qwen4ExpForConditionalGeneration`, each requiring its matching model plumbing. The plugin does not make an unsupported model architecture appear in either vLLM or standalone ExLlamaV3.
+
+The upstream release this integration surface is checked against is **vLLM v0.30.0**. Per-point state — what resolves, what moved, and the one integration that does not carry over — is in [docs/VLLM_COMPATIBILITY.md](docs/VLLM_COMPATIBILITY.md). `tools/check_vllm_compat.py <vllm-tree>` re-runs that check against any tree or release tag.
 
 This candidate's primary qualification target remains **one GB10, TP=1, GLM-5.3-Flash K2 and K2/K3-mix** unless a model-specific recipe says otherwise.
 
@@ -132,7 +134,7 @@ attempt and 90.0 best-of-attempts; the Q4_K_M GGUF of the same model on llama.cp
 same two bases while decoding 1.45x slower and prefilling at roughly half the rate, because its 95.4 GiB BF16
 embedding table is paged from NVMe rather than held resident.
 
-These figures are a record of that revision on that workload. They are not part of the 0.4.2 qualification target above, and they were not re-measured on 0.4.2.
+These figures are a record of that revision on that workload. They are not part of the 0.5.0 qualification target above, and they were not re-measured on 0.5.0.
 
 Routed expert weights remain packed at load time. Some fallback/prefill paths reconstruct **temporary FP16 weights for an expert**; packed loading does not mean zero reconstruction or zero scratch memory. The existing tiled fat-GEMM fast path is gated to eligible **K4/MCG**, non-mul1 projections with compatible gate/up input rotations. K2/K3 and distinct-rotation cases retain their applicable fallback paths.
 

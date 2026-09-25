@@ -1,8 +1,53 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-09-25)
+
+Everything merged since 0.4.2, plus the vLLM 0.30.0 compatibility audit. The MoE kernel work in this
+release is **not on by default**: no serving path selects it unless a recipe asks for it. Numbers
+below are the contributors' measurements on their own hardware unless a section says otherwise.
 
 ### Added
+
+**Routed-expert MoE kernels**
+
+- Multi-K fused MoE (`p2b_fused_moe_mk`): per-expert K tables are read on device, so a mixed-K layer
+  takes one cooperative launch instead of one launch per expert (#31).
+- Fixed-shape padded MoE (`p2b_fused_moe_padded`): fixed shapes and no host sync, so the MoE can be
+  captured into a CUDA graph. The original single cooperative launch cannot be captured at all
+  (`cudaLaunchCooperativeKernel` is illegal under default capture mode, and relaxed mode records
+  nothing), so it is split into nine ordinary same-stream stage kernels. A silent bug found while
+  splitting is fixed with it: the prologue's `accum` zeroing had replicated into all nine stages, so
+  stage 8 zeroed `accum` and wrote the zeros back, making the output independent of the inputs
+  (#33).
+- Grouped padded MoE: live slots are grouped by expert, up to 16 per group, so each trellis tile is
+  decoded once per expert rather than once per slot. `P2B_GROUPED=0` reverts (#39).
+- Opt-in decode routing through exllamav3's cooperative `exl3_moe` kernel for decode-shaped batches
+  on exllamav3 >= 1.5.0 (#27).
+
+**TP geometry**
+
+- Hadamard-aligned uneven TP split for routed experts (`VLLM_EXL3_MOE_TP_ALIGN=128`). `2304 / 4 =
+  576` is not 128-aligned, and EXL3's Hadamard block requires it, so an even TP4 split cuts a block
+  and decodes every shard against the wrong transform. The router's columns are now cut in whole
+  128-blocks — 640 / 640 / 512 / 512 — from the pack that already exists, so MoE-TP4 does not need a
+  re-quantized 640-wide pack. Off unless the variable is set, and unset behaviour is unchanged. The
+  contributor measures +16% single-stream decode on four-Spark DSV4.1-Flash TP4 (#36).
+
+**Engine, load path and host memory**
+
+- DeepSeek-V4.1 TP4+EP4 EXL3 compatibility (#8), per-expert mixed-K routed weights (#10) with the
+  qualification hardening that followed (#11), physical-trellis K derivation (#12), V4.1 cache math
+  and a TP-aware mixed-K prescan (#13), FP8 `weight_block_size` propagation with EP-aware expert
+  loading (#16), and runtime plugin state for the SAGE TP2 pair — tensor metadata, mixed-K store,
+  draft/MTP plan tolerance (#30).
+- Routed-expert trellis arenas placed in pinned host memory for UVA runs (#26), EXL3 trellises copied
+  directly into their final arena slots (#21), and a UMA-safe load path that direct-fills the arena
+  and applies MADV after the H2D (#14).
+- GB10 load path: pinned bounce buffers, `POPULATE_READ`, batched markers and a prescan cache (#28).
+  Reported: the four-rank load drops from about 8.7 to about 5 minutes and fill from 7.5 to 1.6
+  minutes, with decode unchanged.
+- The bounded SAGE NVMe and Engram cache components are shared rather than duplicated (#19), and a
+  gapped-safetensors repair rebuilds a compressed shard without changing tensor bytes (#18).
 
 - Unsharded n-gram tables. Packs from exllamav3 1.5.0 onward ship the table as one `<root>.trellis` tensor instead of `shard_<i>.trellis` pieces; the scan tool now recognises that layout (a `trellis` whose root also carries `head_offsets`), the config tool emits `ngram_embedding.sharded: false` with `num_shards: 1`, and the loader registers the matching `trellis` parameter. No pack rewrite is needed any more for turboderp's `4.05bpw_h6_ng6` revision.
 - `VLLM_EXL3_NGRAM_TABLE=disk`. The packed n-gram table stays in the checkpoint: the loader keeps vLLM's memory-mapped safetensors views instead of copying into a resident int16 tensor, and each lookup gathers its unique rows on the host, uploads them, and decodes on the device. The table then costs page cache rather than 32 to 36 GiB of device memory. The host gather is a synchronization point, so this mode needs `--compilation-config '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [...attention ops..., "vllm::exl3_ngram_lookup_out"]}'`; the loader refuses FULL graph modes with that message. Default stays `resident`. Tests: `tests/test_ngram_layouts.py` (CPU layouts plus in-image coverage of the registered `vllm::exl3_ngram_lookup*` ops, resident/unsharded/disk lookup parity and the FULL-graph refusal), `tests/test_pack_tools_ngram_fixture.py` (synthetic MoE pack through the scan and config tools).
@@ -11,6 +56,52 @@
 - exllamav3 1.5.0 support for the fused routed-expert launch. 1.5.0 appended five positional arguments to `exl3_moe` (`output_scratch`, `fused_base`, `count_lo`, `count_hi`, `m_tile`) for its deterministic-accumulation and row-tile modes; the plugin now reads the binding's arity from its pybind signature and, on 1.5.0, passes the values that reproduce the 1.4.x all-fused atomic launch (`None, None, 1, <temp rows>, 16`). 1.4.x bindings are called exactly as before. `runtime_diagnostics()` records the detected arity as `exllamav3_exl3_moe_arity`. Measured on one GB10 with Qwen3.8-Flash-Next 3.05 bpw at the recipe's envelope config: 52.05 tok/s at MTP k=3 on 1.5.0 against 52.22 on 1.4.7, 28.54 against 27.77 without a draft, prefill unchanged. Kernel version is not a speed lever on this hardware; the change is about running on current upstream. Tests: `tests/test_exl3_moe_arity.py`.
 
 - `tools/gb10_exl3_moe_parity.py`: on-hardware probe for the same launch — one launch per per-layer K against the native `exl3_gemv` map, plus the check that a 1.5.0 binding rejects the 1.4.x arity. `--dry-run` exercises the argument assembly on CPU.
+
+### Fixed
+
+- The native-MoE dispatch gate treated an *unset* codebook flag as a mismatch, so `main` failed 103
+  tests (100 in `test_routing_parity.py`, 3 in `test_activation_parity.py`). The default now resolves
+  to the MCG tuple, and a layer carrying a genuinely non-MCG codebook still fails closed (#34).
+- The expert codebook became a build-time parameter. A pack carrying the **mul1** codebook
+  (`0x83DCD12D`) decoded by an MCG-built kernel does not crash — it produces a plausible-looking
+  wrong vector, which is worse. Build with `-DP2B_CB=2` for mul1 packs; all three codebook checks
+  fail closed (#32).
+- The loader's pre-read EP weight filter was sized once from the main stack's 384 experts and applied
+  to the DSpark draft's 128, so EP ranks 1 to 3 silently loaded none of the draft experts they owned.
+  The contributor measures +9% to +20% decode on the four-Spark DSV4.1 configuration, with acceptance
+  about 1.7 to 2.0 (#35).
+- `_narrow_tp` fell back to the even split when a requested 128-block alignment could not be
+  satisfied — the silent wrong-transform case the aligned path exists to remove. It now raises at
+  load time, with tests (#36).
+- Disabled-CPU symbol behaviour preserved on arm (#20); the redundant CUDA sync after the blocking
+  trellis `copy_` dropped (#29); the aarch64 patch verified against exllamav3 v1.5.0 in CI (#24).
+
+### Compatibility
+
+- **vLLM v0.30.0 audit** in [docs/VLLM_COMPATIBILITY.md](docs/VLLM_COMPATIBILITY.md), re-runnable
+  with `tools/check_vllm_compat.py <tree>`. Verified present: the `vllm.general_plugins`
+  entry-point group, every `from vllm...` import in `src/` and `tools/`, and `FusedMoEMethodBase`'s
+  abstract surface (`create_weights`, `get_fused_moe_quant_config`), which `Exl3MoEMethod`
+  satisfies.
+- The Qwen4Exp model tree moved from `vllm/model_executor/models/qwen4_exp/` to `vllm/models/`. The
+  patch tools already targeted the current layout; their README did not, and now does.
+- PLE n-gram tables: current vLLM builds the table with a quant config itself, so the PLE half of
+  `patch_vllm_qwen4_ple.py` is obsolete and now reports itself as such instead of failing its anchor
+  check. The EXL3 path itself does **not** carry over, because the layer selects its storage format
+  through `Qwen4ExpPLEEmbeddingMethod.from_quant_config`, which raises for any config that is not
+  ModelOpt or `Fp8Config`. An adapter is required; the compatibility page records the two options.
+  DeepSeek-V4.1 serving does not touch this code.
+- Corrected the Engram path `docs/CPU_OFFLOAD.md` cites:
+  `vllm/models/deepseek_v4_1/common/engram.py` is now `.../deepseek_v41/...`.
+
+### Qualification boundary
+
+Nothing here changes a default serving path: the new MoE kernels are exported, not selected, and
+`apply_exl3_fused_moe` dispatches exactly as it did. Enabling them, and building with `-DP2B_CB=2`
+for a **mul1** pack, is a recipe decision. The speed figures above are the contributors' measurements
+on their own GB10 configurations and were not re-measured for this tag. The kernel batch needs a
+GB10 qualification run — parity against the Python `LinearEXL3` reference, then the standard gate —
+before a recipe adopts it.
 
 ## 0.4.2 (2026-09-09)
 
