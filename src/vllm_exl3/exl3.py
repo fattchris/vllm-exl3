@@ -1163,10 +1163,59 @@ def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
     return stats
 
 
-def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
+def _moe_tp_align() -> int:
+    """Column alignment for routed-expert TP shards (VLLM_EXL3_MOE_TP_ALIGN, 0 = off).
+
+    EXL3 applies its input/output Hadamard transforms in 128-wide blocks, so a
+    TP shard boundary must not cut a block. With 128 set, the intermediate dim
+    is split in whole blocks, unevenly when needed: DSV4.1's 2304 over tp=4
+    becomes 640/640/512/512 instead of the 576 equal chunk that straddles blocks.
+    """
+    try:
+        return int(os.environ.get("VLLM_EXL3_MOE_TP_ALIGN", "0"))
+    except ValueError:
+        return 0
+
+
+def aligned_tp_split(size: int, tp_rank: int, tp_size: int, align: int) -> tuple[int, int]:
+    """(offset, length) of rank's shard when ``size`` is split in ``align`` blocks."""
+    if size % align:
+        raise ValueError(f"EXL3 aligned TP shard: size {size} is not a multiple of {align}")
+    base, rem = divmod(size // align, tp_size)
+    counts = [base + (1 if r < rem else 0) for r in range(tp_size)]
+    return sum(counts[:tp_rank]) * align, counts[tp_rank] * align
+
+
+def _narrow_tp(
+    tensor: torch.Tensor,
+    dim: int,
+    tp_rank: int,
+    tp_size: int,
+    unit: int = 1,
+    aligned: bool = False,
+) -> torch.Tensor:
+    """Narrow ``dim`` to this rank's shard.
+
+    ``aligned`` (routed experts only) applies the VLLM_EXL3_MOE_TP_ALIGN block
+    split; ``unit`` is columns per index along ``dim`` (16 for trellis tiles).
+    """
     if tp_size <= 1:
         return tensor
     size = int(tensor.shape[dim])
+    align = _moe_tp_align() if aligned else 0
+    if align > 0:
+        if (size * unit) % align:
+            # Falling through to the equal split here would cut a Hadamard block
+            # and decode every shard against the wrong transform, silently. This
+            # path is only reachable with the opt-in env var set, so refuse the
+            # geometry instead of loading weights that cannot be right.
+            raise RuntimeError(
+                f"EXL3 aligned MoE TP: dim {dim} spans {size * unit} columns, which "
+                f"is not a multiple of the VLLM_EXL3_MOE_TP_ALIGN={align} Hadamard "
+                "block; unset VLLM_EXL3_MOE_TP_ALIGN or use an expert-parallel build"
+            )
+        off, length = aligned_tp_split(size * unit, tp_rank, tp_size, align)
+        return tensor.narrow(dim, off // unit, length // unit).contiguous()
     if size % tp_size:
         raise ValueError(
             f"EXL3 TP shard: dim {dim} size {size} is not divisible by tp={tp_size}"
@@ -1197,21 +1246,25 @@ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
     return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
 
 
-def shard_exl3_col(loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int) -> torch.Tensor:
+def shard_exl3_col(
+    loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int, aligned: bool = False
+) -> torch.Tensor:
     """Gate/up: trellis dim 1 and svh dim 0 are column-parallel."""
     if suffix == "trellis":
-        return _narrow_tp(loaded, 1, tp_rank, tp_size)
+        return _narrow_tp(loaded, 1, tp_rank, tp_size, 16, aligned)
     if suffix == "svh":
-        return _narrow_tp(loaded, 0, tp_rank, tp_size)
+        return _narrow_tp(loaded, 0, tp_rank, tp_size, 1, aligned)
     return loaded.contiguous()
 
 
-def shard_exl3_row(loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int) -> torch.Tensor:
+def shard_exl3_row(
+    loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int, aligned: bool = False
+) -> torch.Tensor:
     """Down: trellis dim 0 and suh dim 0 are row-parallel."""
     if suffix == "trellis":
-        return _narrow_tp(loaded, 0, tp_rank, tp_size)
+        return _narrow_tp(loaded, 0, tp_rank, tp_size, 16, aligned)
     if suffix == "suh":
-        return _narrow_tp(loaded, 0, tp_rank, tp_size)
+        return _narrow_tp(loaded, 0, tp_rank, tp_size, 1, aligned)
     return loaded.contiguous()
 
 
@@ -2803,6 +2856,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         del params_dtype
         from .tensor_mixed_k import create_mixed_weights, tensor_mixed_k_enabled
 
+        # Hadamard-aligned uneven TP (VLLM_EXL3_MOE_TP_ALIGN): vLLM hands every
+        # rank the equal chunk; replace it with this rank's block-aligned width.
+        align = _moe_tp_align()
+        if align > 0 and not getattr(layer, "use_ep", False):
+            tp_rank, tp_size = _resolve_tp_geometry(layer)
+            full = intermediate_size_per_partition * tp_size
+            if tp_size > 1 and full % align == 0:
+                offset, local = aligned_tp_split(full, tp_rank, tp_size, align)
+                logger.info(
+                    "EXL3 aligned MoE TP: rank %d/%d intermediate %d -> %d (offset %d)",
+                    tp_rank, tp_size, intermediate_size_per_partition, local, offset,
+                )
+                intermediate_size_per_partition = local
+
         if tensor_mixed_k_enabled():
             # Only the opt-in exact-width store needs 128-aligned local dims; the
             # default uniform-K path keeps main's 16-alignment contract untouched.
@@ -3046,10 +3113,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             if _exl3_mem_waterfall_enabled():
                 _exl3_mem_snapshot("BEFORE_SOURCE", owner_mod)
             if shard_id in ("w1", "w3"):
-                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
+                sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size, aligned=True)
                 plist = owner_mod.gate_trellis if shard_id == "w1" else owner_mod.up_trellis
             elif shard_id == "w2":
-                sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
+                sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size, aligned=True)
                 plist = owner_mod.down_trellis
             else:
                 raise ValueError(f"unknown EXL3 shard_id={shard_id}")
@@ -3186,10 +3253,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             raise RuntimeError("EXL3 scale load missing owner module")
         if shard_id in ("w1", "w3"):
             shard_idx = 0 if shard_id == "w1" else 1
-            sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
+            sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size, aligned=True)
             dest = getattr(owner_mod, "w13_" + suffix).data[expert_id, shard_idx]
         elif shard_id == "w2":
-            sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
+            sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size, aligned=True)
             dest = getattr(owner_mod, "w2_" + suffix).data[expert_id]
         else:
             raise ValueError(f"unknown EXL3 shard_id={shard_id}")
