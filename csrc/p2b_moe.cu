@@ -323,6 +323,323 @@ __device__ __forceinline__ void run_gemv_tile_k(
     }
 }
 
+// _GROUPED: expert groups of live routing slots, rebuilt by stage 0 every launch.
+#define P2B_MAX_GROUPS 1024
+#define P2B_GROUP_ROWS 16
+__device__ int p2b_g_ngroups;
+__device__ int p2b_g_expert[P2B_MAX_GROUPS];
+__device__ int p2b_g_count[P2B_MAX_GROUPS];
+__device__ int p2b_g_slots[P2B_MAX_GROUPS][P2B_GROUP_ROWS];
+
+template <int bits, int cb, int CFG>
+__device__ __forceinline__ void run_gemv_tile_m(
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2base, int a_stride,
+    const int* __restrict__ rows, int nrows,
+    half* __restrict__ Cbase, int c_stride,
+    int kslices,
+    int size_k,
+    int group,
+    int ntiles,
+    int warp,
+    int lane,
+    float (*sh_red)[16][32])
+{
+    constexpr int WK = CFG == 0 ? 16 : 8;
+    constexpr int WNT = CFG == 0 ? 2 : 4;
+    constexpr int PF = CFG == 0 ? 4 : 2;
+    constexpr int FOLD = CFG == 0 ? 4 : 2;
+    constexpr int THREADS = WK * 32;
+    constexpr int COLS = WNT * 16;
+    constexpr int TWORDS = 8 * bits;
+    constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;
+    constexpr int LSTRIDE = bits == 3 ? 24 : 32;
+
+    const int chunk = CEIL_DIVIDE(kslices, WK);
+    const int ks0 = warp * chunk;
+    const int myn = max(0, min(chunk, kslices - ks0));
+    const size_t slice_stride = (size_t) ntiles * TWORDS;
+
+    const size_t a_row0 = 0;
+        // _GROUPED: A-fragment row g = lane>>2 ([0] regs) and g+8 ([1] regs).
+    const int g_row = lane >> 2;
+    const int slot_a = g_row < nrows ? rows[g_row] : -1;
+    const int slot_b = g_row + 8 < nrows ? rows[g_row + 8] : -1;
+    const half2* __restrict__ pa = A2base + (size_t) (slot_a < 0 ? 0 : slot_a) * a_stride;
+    const half2* __restrict__ pb = A2base + (size_t) (slot_b < 0 ? 0 : slot_b) * a_stride;
+    const half2 hzero = __half2half2(__ushort_as_half(0));
+
+    int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+    if constexpr (bits == 2) {
+        int i1 = lane >> 1;
+        x_src_b = i1;
+        x_src_a = (i1 + 15) & 15;
+    } else if constexpr (bits == 3) {
+        int t_offset = lane << 3;
+        int b1 = (t_offset + 257) * 3;
+        int b2 = b1 + 21;
+        int i0 = (b1 - 16) / 32;
+        int i2 = (b2 - 1) / 32;
+        x_s2 = (i2 + 1) * 32 - b2;
+        x_src_a = i0 % 24;
+        x_src_b = i2 % 24;
+    }
+
+    const uint32_t* bp = B32 + (size_t) ks0 * slice_stride + group * WNT * TWORDS + lane;
+
+    auto ld_b = [&] (int i, int l) -> uint32_t {
+        if constexpr (bits == 3)
+            return lane < 24 ? __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE) : 0;
+        else
+            return __ldcs(bp + (size_t) i * slice_stride + l * LSTRIDE);
+    };
+
+    uint32_t pf[PF][LOADS];
+    #pragma unroll
+    for (int d = 0; d < PF; ++d)
+        if (d < myn)
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                pf[d][l] = ld_b(d, l);
+
+    FragC_h ch[WNT][2] = {};
+    float2 acc0[WNT][2] = {};
+    float2 acc1[WNT][2] = {};
+
+    for (int ib = 0; ib < myn; ib += PF) {
+        #pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int i = ib + d;
+            if (i >= myn) break;
+
+            uint32_t bw[LOADS];
+            #pragma unroll
+            for (int l = 0; l < LOADS; ++l)
+                bw[l] = pf[d][l];
+
+            if (i + PF < myn) {
+                #pragma unroll
+                for (int l = 0; l < LOADS; ++l)
+                    pf[d][l] = ld_b(i + PF, l);
+            }
+
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            FragB a01, a23;
+            a01[0] = slot_a >= 0 ? pa[a_col] : hzero;
+            a23[0] = slot_a >= 0 ? pa[a_col + 4] : hzero;
+            a01[1] = slot_b >= 0 ? pb[a_col] : hzero;
+            a23[1] = slot_b >= 0 ? pb[a_col + 4] : hzero;
+
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t) {
+                FragB f0, f1;
+                if constexpr (bits == 4) {
+                    uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
+                    exl3_gemv_ns::dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+                } else if constexpr (bits == 2) {
+                    const uint32_t w = bw[t >> 1];
+                    const int base = (t & 1) << 4;
+                    uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
+                    uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
+                    exl3_gemv_ns::dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+                } else {
+                    uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
+                    uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
+                    exl3_gemv_ns::dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+                }
+
+                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+            }
+
+            if ((d + 1) % FOLD == 0 || i + 1 == myn) {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f) {
+                        acc0[t][f].x += __low2float(ch[t][f][0]);
+                        acc0[t][f].y += __high2float(ch[t][f][0]);
+                        ch[t][f][0] = hzero;
+                        acc1[t][f].x += __low2float(ch[t][f][1]);
+                        acc1[t][f].y += __high2float(ch[t][f][1]);
+                        ch[t][f][1] = hzero;
+                    }
+            }
+        }
+    }
+
+    // Warp reduction, per A row (rows g and g+8 of every lane).
+    #pragma unroll
+    for (int t = 0; t < WNT; ++t) {
+        #pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            const int col = t * 16 + f * 8 + (lane & 3) * 2;
+            if (g_row < nrows) {
+                sh_red[warp][g_row][col + 0] = acc0[t][f].x;
+                sh_red[warp][g_row][col + 1] = acc0[t][f].y;
+            }
+            if (g_row + 8 < nrows) {
+                sh_red[warp][g_row + 8][col + 0] = acc1[t][f].x;
+                sh_red[warp][g_row + 8][col + 1] = acc1[t][f].y;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < nrows * COLS; idx += THREADS) {
+        const int r = idx / COLS;
+        const int c = idx % COLS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < WK; ++j)
+            sum += sh_red[j][r][c];
+        Cbase[(size_t) rows[r] * c_stride + group * COLS + c] = __float2half_rn(sum);
+    }
+    __syncthreads();
+}
+
+template <int bits, int cb, int CFG>
+__device__ __forceinline__ void run_gemm_tile_dq_m(
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2base, int a_stride,
+    const int* __restrict__ rows, int nrows,
+    half* __restrict__ Cbase, int c_stride,
+    int kslices,
+    int size_k,
+    int group,
+    int ntiles,
+    int warp,
+    int lane,
+    float (*sh_red)[16][32])
+{
+    constexpr int WK = CFG == 0 ? 16 : 8;
+    constexpr int WNT = CFG == 0 ? 2 : 4;
+    constexpr int PF = CFG == 0 ? 4 : 2;
+    constexpr int FOLD = CFG == 0 ? 4 : 2;
+    constexpr int THREADS = WK * 32;
+    constexpr int COLS = WNT * 16;
+    constexpr int TWORDS = 8 * bits;
+
+    const int chunk = CEIL_DIVIDE(kslices, WK);
+    const int ks0 = warp * chunk;
+    const int myn = max(0, min(chunk, kslices - ks0));
+    const size_t slice_stride = (size_t) ntiles * TWORDS;
+
+        // _GROUPED: A-fragment row g = lane>>2 ([0] regs) and g+8 ([1] regs).
+    const int g_row = lane >> 2;
+    const int slot_a = g_row < nrows ? rows[g_row] : -1;
+    const int slot_b = g_row + 8 < nrows ? rows[g_row + 8] : -1;
+    const half2* __restrict__ pa = A2base + (size_t) (slot_a < 0 ? 0 : slot_a) * a_stride;
+    const half2* __restrict__ pb = A2base + (size_t) (slot_b < 0 ? 0 : slot_b) * a_stride;
+    const half2 hzero = __half2half2(__ushort_as_half(0));
+
+    FragC_h ch[WNT][2] = {};
+    float2 acc0[WNT][2] = {};
+    float2 acc1[WNT][2] = {};
+
+    for (int ib = 0; ib < myn; ib += PF) {
+        #pragma unroll
+        for (int d = 0; d < PF; ++d) {
+            const int i = ib + d;
+            if (i >= myn) break;
+
+            const size_t a_col = (size_t) (ks0 + i) * 8 + (lane & 3);
+            FragB a01, a23;
+            a01[0] = slot_a >= 0 ? pa[a_col] : hzero;
+            a23[0] = slot_a >= 0 ? pa[a_col + 4] : hzero;
+            a01[1] = slot_b >= 0 ? pb[a_col] : hzero;
+            a23[1] = slot_b >= 0 ? pb[a_col + 4] : hzero;
+
+            #pragma unroll
+            for (int t = 0; t < WNT; ++t) {
+                const uint32_t* tw = B32
+                    + (size_t) (ks0 + i) * slice_stride
+                    + (size_t) (group * WNT + t) * TWORDS;
+                FragB f0, f1;
+                dq_dispatch<bits, cb>(tw, lane << 3, f0, f1);
+                exl3_gemv_ns::mma_ab_h(a01, a23, f0, ch[t][0]);
+                exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
+            }
+
+            if ((d + 1) % FOLD == 0 || i + 1 == myn) {
+                #pragma unroll
+                for (int t = 0; t < WNT; ++t)
+                    #pragma unroll
+                    for (int f = 0; f < 2; ++f) {
+                        acc0[t][f].x += __low2float(ch[t][f][0]);
+                        acc0[t][f].y += __high2float(ch[t][f][0]);
+                        ch[t][f][0] = hzero;
+                        acc1[t][f].x += __low2float(ch[t][f][1]);
+                        acc1[t][f].y += __high2float(ch[t][f][1]);
+                        ch[t][f][1] = hzero;
+                    }
+            }
+        }
+    }
+
+    // Warp reduction, per A row (rows g and g+8 of every lane).
+    #pragma unroll
+    for (int t = 0; t < WNT; ++t) {
+        #pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            const int col = t * 16 + f * 8 + (lane & 3) * 2;
+            if (g_row < nrows) {
+                sh_red[warp][g_row][col + 0] = acc0[t][f].x;
+                sh_red[warp][g_row][col + 1] = acc0[t][f].y;
+            }
+            if (g_row + 8 < nrows) {
+                sh_red[warp][g_row + 8][col + 0] = acc1[t][f].x;
+                sh_red[warp][g_row + 8][col + 1] = acc1[t][f].y;
+            }
+        }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < nrows * COLS; idx += THREADS) {
+        const int r = idx / COLS;
+        const int c = idx % COLS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < WK; ++j)
+            sum += sh_red[j][r][c];
+        Cbase[(size_t) rows[r] * c_stride + group * COLS + c] = __float2half_rn(sum);
+    }
+    __syncthreads();
+}
+
+template <int CB>
+__device__ __forceinline__ void run_gemv_tile_k_m(
+    int bits,
+    const uint32_t* __restrict__ B32,
+    const half2* __restrict__ A2base, int a_stride,
+    const int* __restrict__ rows, int nrows,
+    half* __restrict__ Cbase, int c_stride,
+    int kslices,
+    int size_k,
+    int group,
+    int ntiles,
+    int warp,
+    int lane,
+    float (*sh_red)[16][32])
+{
+    switch (bits) {
+        case 2: run_gemv_tile_m<2, CB, 0>(B32, A2base, a_stride, rows, nrows, Cbase, c_stride, kslices, size_k, group, ntiles, warp, lane, sh_red); break;
+        case 3: run_gemv_tile_m<3, CB, 0>(B32, A2base, a_stride, rows, nrows, Cbase, c_stride, kslices, size_k, group, ntiles, warp, lane, sh_red); break;
+        case 4: run_gemv_tile_m<4, CB, 0>(B32, A2base, a_stride, rows, nrows, Cbase, c_stride, kslices, size_k, group, ntiles, warp, lane, sh_red); break;
+        case 5: run_gemm_tile_dq_m<5, CB, 0>(B32, A2base, a_stride, rows, nrows, Cbase, c_stride, kslices, size_k, group, ntiles, warp, lane, sh_red); break;
+        case 6: run_gemm_tile_dq_m<6, CB, 0>(B32, A2base, a_stride, rows, nrows, Cbase, c_stride, kslices, size_k, group, ntiles, warp, lane, sh_red); break;
+        default: {
+            // Unreachable: Python validates the table values (2..6) when the
+            // tables are built in finalize. Zero the tile deterministically
+            // so a bad table can never propagate garbage into the reduction.
+            for (int idx = threadIdx.x; idx < nrows * 32; idx += 512)
+                Cbase[(size_t) rows[idx / 32] * c_stride + group * 32 + idx % 32] = __float2half_rn(0.0f);
+            break;
+        }
+    }
+}
+
+
 template <int BITS>
 __global__ __launch_bounds__(512)
 void p2b_moe_batched_kernel(
@@ -1059,6 +1376,40 @@ void p2b_moe_padded_stage0(
         }
 
     }
+
+    // _GROUPED: block 0 groups the live, valid slots by expert (<=16 per group),
+    // in slot order, via a per-expert "open group" table in shared memory.
+    if (blockIdx.x == 0) {
+        __shared__ int emap[1024];
+        const bool use_map = n_local <= 1024;
+        if (use_map)
+            for (int q = threadIdx.x; q < n_local; q += blockDim.x) emap[q] = -1;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int ng = 0;
+            const int nv = n_valid_dev[0];
+            for (int e = 0; e < live; ++e) {
+                const int src = ids[e];
+                if (src < 0 || src >= n_local || e / max_k >= nv) continue;
+                int g = -1;
+                if (use_map) {
+                    g = emap[src];
+                } else {
+                    for (int q = ng - 1; q >= 0; --q)
+                        if (p2b_g_expert[q] == src) { g = q; break; }
+                }
+                if (g < 0 || p2b_g_count[g] == P2B_GROUP_ROWS) {
+                    if (ng == P2B_MAX_GROUPS) continue;
+                    g = ng++;
+                    p2b_g_expert[g] = src;
+                    p2b_g_count[g] = 0;
+                    if (use_map) emap[src] = g;
+                }
+                p2b_g_slots[g][p2b_g_count[g]++] = e;
+            }
+            p2b_g_ngroups = ng;
+        }
+    }
 }
 
 __global__ __launch_bounds__(512)
@@ -1727,6 +2078,165 @@ void p2b_moe_padded_stage8(
 }
 
 
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage1_grouped(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Phase 2 (_GROUPED): Gate & Up GEMV, one work item per (expert group, col group).
+    {
+        __shared__ float sh_red_m[16][16][32];
+        const int ng = p2b_g_ngroups;
+        int total_work = 2 * ng * num_groups_gate;
+        for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
+            int is_up = item & 1;
+            int rem = item >> 1;
+            int g = rem / num_groups_gate;
+            int group = rem % num_groups_gate;
+            int src = p2b_g_expert[g];
+            const uint32_t* B32 = reinterpret_cast<const uint32_t*>(is_up ? ut_ptrs[src] : gt_ptrs[src]);
+            const half2* A2b = reinterpret_cast<const half2*>(is_up ? had_up : had_gate);
+            half* Cb = is_up ? up : gate;
+            const int kb = (int) (is_up ? ku_tab[src] : kg_tab[src]);
+            run_gemv_tile_k_m<P2B_CB>(kb, B32, A2b, hidden / 2, p2b_g_slots[g], p2b_g_count[g],
+                                      Cb, inter, kslices_gate, hidden, group, ntiles_gate, warp, lane, sh_red_m);
+        }
+    }
+}
+
+__global__ __launch_bounds__(512)
+void p2b_moe_padded_stage5_grouped(
+    const half* __restrict__ x,
+    const int64_t* __restrict__ gt_ptrs,
+    const int64_t* __restrict__ gu_ptrs,
+    const int64_t* __restrict__ gv_ptrs,
+    const int64_t* __restrict__ ut_ptrs,
+    const int64_t* __restrict__ uu_ptrs,
+    const int64_t* __restrict__ uv_ptrs,
+    const int64_t* __restrict__ dt_ptrs,
+    const int64_t* __restrict__ du_ptrs,
+    const int64_t* __restrict__ dv_ptrs,
+    const int32_t* __restrict__ ids,
+    const half* __restrict__ rw,
+    const int8_t* __restrict__ kg_tab,
+    const int8_t* __restrict__ ku_tab,
+    const int8_t* __restrict__ kd_tab,
+    const int32_t* __restrict__ n_valid_dev,
+    int n_local,
+    int max_k,
+    half* __restrict__ gate,
+    half* __restrict__ up,
+    half* __restrict__ down,
+    half* __restrict__ out,
+    half* __restrict__ had_gate,
+    half* __restrict__ had_up,
+    half* __restrict__ had_down,
+    float* __restrict__ accum,
+    int experts,
+    int hidden,
+    int inter,
+    float swiglu_limit)
+{
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_threads = gridDim.x * blockDim.x;
+
+    // experts == MAX_T * MAX_K (host validates ids == [x.size(0), max_k]).
+    const int max_t = experts / max_k;
+    // Only the live prefix of the routing grid (n_valid rows) is iterated;
+    // slots past it are padding and were previously skipped one by one.
+    const int live = min(experts, n_valid_dev[0] * max_k);
+
+    const int ntiles_gate = inter / 16;
+    const int kslices_gate = hidden / 16;
+    const int num_groups_gate = inter / 32;
+
+    const int ntiles_down = hidden / 16;
+    const int kslices_down = inter / 16;
+    const int num_groups_down = hidden / 32;
+
+    __shared__ float sh_red[16][1][32];
+
+    // Zero accum for every padded row (defensive only): the deterministic
+    // reduction below rewrites every row — padded rows as exact zeros — so
+    // the write-back emits zeros for them.
+
+    // Phase 1: Input Hadamard for Gate and Up across all routing-grid slots
+    
+    // Phase 4 (_GROUPED): Down GEMV, one work item per (expert group, col group).
+    {
+        __shared__ float sh_red_m[16][16][32];
+        const int ng = p2b_g_ngroups;
+        int total_work = ng * num_groups_down;
+        for (int item = blockIdx.x; item < total_work; item += gridDim.x) {
+            int g = item / num_groups_down;
+            int group = item % num_groups_down;
+            int src = p2b_g_expert[g];
+            const uint32_t* B32 = reinterpret_cast<const uint32_t*>(dt_ptrs[src]);
+            const int kb = (int) kd_tab[src];
+            run_gemv_tile_k_m<P2B_CB>(kb, B32, reinterpret_cast<const half2*>(had_down), inter / 2,
+                                      p2b_g_slots[g], p2b_g_count[g], down, hidden,
+                                      kslices_down, inter, group, ntiles_down, warp, lane, sh_red_m);
+        }
+    }
+}
+
 static void launch_moe_padded(
     const at::Tensor& x, const at::Tensor& gt, const at::Tensor& gu,
     const at::Tensor& gv, const at::Tensor& ut, const at::Tensor& uu,
@@ -1796,13 +2306,17 @@ static void launch_moe_padded(
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &resident, (void*) p2b_moe_padded_stage0, 512, 0);
     const int grid_split = std::max(1, resident * sms);
+    static const bool grouped = [] {
+        const char* v = getenv("P2B_GROUPED");
+        return !(v && v[0] == '0');
+    }();
     void* kernels[] = {
         (void*) p2b_moe_padded_stage0,
-        (void*) p2b_moe_padded_stage1,
+        grouped ? (void*) p2b_moe_padded_stage1_grouped : (void*) p2b_moe_padded_stage1,
         (void*) p2b_moe_padded_stage2,
         (void*) p2b_moe_padded_stage3,
         (void*) p2b_moe_padded_stage4,
-        (void*) p2b_moe_padded_stage5,
+        grouped ? (void*) p2b_moe_padded_stage5_grouped : (void*) p2b_moe_padded_stage5,
         (void*) p2b_moe_padded_stage6,
         (void*) p2b_moe_padded_stage7,
         (void*) p2b_moe_padded_stage8,
